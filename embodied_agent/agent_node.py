@@ -1,9 +1,11 @@
 import rclpy
+import os
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile
 from std_msgs.msg import String 
 from .agent import embodied_agent
-from .utils import format_message
+from .utils import format_message, Context
+from .config import get_config
 
 class Agent(Node):
     def __init__(self):
@@ -15,7 +17,6 @@ class Agent(Node):
         self.get_logger().info("Agent node initialised!")
         
         self.message_recieved: bool = False
-    
     
     
     def query_callback (self, msg):
@@ -31,13 +32,15 @@ class Agent(Node):
         
         # Invoke the Agent with user query and handle failure
         try:
-            self.get_logger().info(f"Invoking Agent with User Query")
-            self.agent.invoke(msg.data)
+            self.get_logger().info(f"Invoking Agent with User Query {msg.data}")
+            response = self.agent.invoke(format_message(msg.data), config=get_config(), context=Context(user_id="1"))    
+            print(response)
         except Exception as e:
-            self.get_logger().info(f"Error executing user Query: {e}")
+            self.get_logger().info(f"Error executing User Query: {e}")
         finally:
             self.message_recieved = False
             self.get_logger().info("Waiting for the next message...\n")
+        
         
 def main ():
     rclpy.init()
