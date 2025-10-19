@@ -4,8 +4,9 @@ from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile
 from std_msgs.msg import String 
 from .agent import embodied_agent
-from .utils import format_message, Context
+from .utils import format_message, format_response, print_response
 from .config import get_config
+from .context import Context
 
 class Agent(Node):
     def __init__(self):
@@ -28,13 +29,19 @@ class Agent(Node):
             self.message_recieved = True
         
         # Confirm message recieved from the user    
-        self.get_logger().info(f"User Query: {msg.data}")
+        self.get_logger().info(f"User Query: '{msg.data}'")
         
         # Invoke the Agent with user query and handle failure
         try:
             self.get_logger().info(f"Invoking Agent with User Query {msg.data}")
-            response = self.agent.invoke(format_message(msg.data), config=get_config(), context=Context(user_id="1"))    
-            print(response)
+            
+            response = self.agent.invoke(
+                format_message(msg.data), 
+                config=get_config(), 
+                context={"user_role": "beginner"})    
+            
+            print_response(format_response(response))
+        
         except Exception as e:
             self.get_logger().info(f"Error executing User Query: {e}")
         finally:
