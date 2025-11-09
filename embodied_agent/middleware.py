@@ -1,9 +1,8 @@
-from langchain.agents.middleware.types import modify_model_request, AgentState, ModelRequest
+from langchain.agents.middleware.types import AgentState, ModelRequest
 from langgraph.runtime import Runtime
 from .context import Context
 
 
-@modify_model_request
 def dynamic_system_prompt(request: ModelRequest, state: AgentState, runtime: Runtime[Context]) -> ModelRequest:
     user_role = runtime.context.get("user_role", "user")
     base_prompt = "You are a helpful assistant."

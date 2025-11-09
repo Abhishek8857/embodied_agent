@@ -17,8 +17,7 @@ os.environ["LANGMSMITH_API_KEY"]=get_langsmith_api_key()
 
 embodied_agent = create_agent(model=get_llm(), 
                      tools=get_tools(), 
-                     prompt=get_prompts(),
+                     system_prompt=get_prompts(),
                      context_schema=Context,
-                     middleware=[dynamic_system_prompt],
                      checkpointer=get_memory())
 
