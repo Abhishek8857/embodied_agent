@@ -1,2 +1,4 @@
 /.vscode
 /log
+/**.code-workspace
+**/**.code-workspace

@@ -1,5 +1,6 @@
-from langchain.agents.middleware.types import AgentState, ModelRequest
+from langchain.agents.middleware.types import AgentState, ModelRequest, wrap_model_call, wrap_tool_call
 from langgraph.runtime import Runtime
+from langchain_core.messages import ToolMessage
 from .context import Context
 
 
@@ -17,3 +18,19 @@ def dynamic_system_prompt(request: ModelRequest, state: AgentState, runtime: Run
     request.system_prompt = prompt
     return request
 
+@wrap_model_call
+def dynamic_model_selection():
+    pass
+
+
+
+@wrap_tool_call
+def handle_tool_errors(request, handler):
+    """Handle tool execution errors with custom messages."""
+    try:
+        return handler(request)
+    except Exception as e:
+        return ToolMessage(
+                        content=f"Tool error: Please check your input and try again. ({str(e)})",
+            tool_call_id=request.tool_call["id"]
+        )

@@ -11,26 +11,6 @@ from langchain.messages import HumanMessage
 from .context import Context
 from .llm import get_llm
 
-# @tool
-# @traceable
-# def save_user_info(user_info: UserInfo):
-#     """Saves the user information
-
-#     Args:
-#         user_info (UserInfo): name
-
-#     Returns:
-#         str : Confirmation of succesful execution
-#     """
-#     runtime = get_runtime(Context)
-#     store = runtime.store 
-#     user_id = runtime.context.user_id 
-#     # Store data in the store (namespace, key, data)
-#     store.put(("users",), user_id, user_info) 
-    
-#     return "Successfully saved user info."
-
-
 @tool(name_or_callable="multiply",description="Tool used to multiple numbers")
 def multiply(a: int, b: int) -> int:
     """Multiply a and b.
@@ -89,7 +69,8 @@ def describe_what_you_see():
     return ai_msg.content
     
         
-        
+
+
 def get_tools():
     tools=[multiply,
             divide,
