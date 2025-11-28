@@ -1,6 +1,11 @@
 import os
+import rclpy
 from dataclasses import dataclass
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from .nodes import AgentPublisher
+from std_msgs.msg import Float64MultiArray, Bool
+
+
 
 @dataclass
 class Context:
@@ -99,7 +104,33 @@ def print_response(data: dict):
         print()
 
 
+def publish_to(type_name, topic_name: str, coordinates: list = None, msg: bool = None) -> None:
+    """
+    Publishes Coordinates to MoveIt
 
+    Args:
+        coordinates (list) = None :  Desired coordinates to publish
+        msg (bool) = None : Desired Bool Message to publish
+    """
+    try:
+        # Initialise the ROS2 Node to publish the coordinates
+        publisher_node = AgentPublisher(type=type_name, topic=topic_name)
+        if type_name == Float64MultiArray:
+            publisher_node.publish_callback(coordinates)
+        elif type_name == Bool:
+            publisher_node.publish_callback(msg)
+        
+        # Spin the Node to keep it publishing
+        rclpy.spin_once(publisher_node, timeout_sec=0.1)
+
+        # Destroy Node
+        publisher_node.destroy_node()
+    except Exception as e:
+        print(f"Error Publishing Coordinates to Robot: {e}")
+        return
+    finally:
+        publisher_node.destroy_node()
+    
 
 def get_openai_api_key() -> str: 
     try:

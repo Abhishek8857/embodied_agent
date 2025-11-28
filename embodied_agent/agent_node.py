@@ -4,7 +4,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile
 from std_msgs.msg import String 
 from .agent import embodied_agent
-from .utils import format_message, format_response, print_response
+from .utils.utils import format_message, format_response, print_response
 from .config import get_config
 from .context import Context
 

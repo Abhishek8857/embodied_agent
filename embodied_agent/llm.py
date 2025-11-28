@@ -1,6 +1,6 @@
 import os
 from langchain_openai import ChatOpenAI
-from .utils import get_openai_api_key
+from .utils.utils import get_openai_api_key
 
 
 temperature: float = 0.8
