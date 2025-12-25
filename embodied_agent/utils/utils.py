@@ -1,10 +1,14 @@
 import os
+import math
 import rclpy
+import tf2_ros
+
+from rclpy.duration import Duration
+from rclpy.time import Time
 from dataclasses import dataclass
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from .nodes import AgentPublisher
 from std_msgs.msg import Float64MultiArray, Bool
-
 
 
 @dataclass
@@ -13,11 +17,72 @@ class Context:
     user_id: str
 
 
+class TfPoseLookup:
+    """Keeps a TF buffer/listener and provides pose lookup as a dict."""
+    def __init__(self, node, cache_time_s: float = 10.0):
+        self.node = node
+        self.buffer = tf2_ros.Buffer(cache_time=Duration(seconds=float(cache_time_s)))
+        # spin_thread=True keeps TF updates flowing even if tools block briefly
+        self.listener = tf2_ros.TransformListener(self.buffer, node, spin_thread=True)
+
+    def get_pose(self, base_frame: str, ee_frame: str, timeout_s: float = 1.0):
+        try:
+            ok = self.buffer.can_transform(
+                base_frame, ee_frame, Time(),
+                timeout=Duration(seconds=float(timeout_s)),
+            )
+            if not ok:
+                return {
+                    "success": False,
+                    "error_code": "TF_TIMEOUT",
+                    "error_description": f"TF not available: {base_frame} <- {ee_frame} (timeout {timeout_s}s)",
+                }
+
+            tf = self.buffer.lookup_transform(
+                base_frame, ee_frame, Time(),
+                timeout=Duration(seconds=float(timeout_s)),
+            )
+
+            t = tf.transform.translation
+            q = tf.transform.rotation
+            roll, pitch, yaw = quat_to_rpy(q.x, q.y, q.z, q.w)
+
+            return {
+                "success": True,
+                "base_frame": base_frame,
+                "ee_frame": ee_frame,
+                "translation": {"x": float(t.x), "y": float(t.y), "z": float(t.z)},
+                "quaternion": {"x": float(q.x), "y": float(q.y), "z": float(q.z), "w": float(q.w)},
+                "rpy_rad": {"r": float(roll), "p": float(pitch), "y": float(yaw)},
+                "rpy_deg": {"r": float(roll * 180.0 / math.pi),
+                            "p": float(pitch * 180.0 / math.pi),
+                            "y": float(yaw * 180.0 / math.pi)},
+            }
+
+        except (tf2_ros.LookupException,
+                tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException) as e:
+            return {
+                "success": False,
+                "error_code": "TF_LOOKUP_FAILED",
+                "error_description": str(e),
+            }
+            
+
 def format_message (msg: str) -> dict:
     return {"messages": [{"role" : "user" , "content": msg}]}
 
 
 def format_response(msg: dict) -> dict:
+    """
+    Function to format and print the Agents response to a Readable format in terminal
+
+    Args:
+        msg (dict): The output of the Agent in a dictionary format.
+
+    Returns:
+        dict: Formatted response in a dictionary format with human_messages, ai_messages, final_response as keys.
+    """
     data = msg["messages"]
     human_messages: list = []
     ai_messages: list = []
@@ -42,10 +107,13 @@ def format_response(msg: dict) -> dict:
 
 
 def print_response(data: dict):
-    """
+    """    
     Print only the latest full exchange (Human → AI → Tool(s) → Final AI Response).
     Handles multiple tool calls made during one request.
     Clears the screen before printing for a live-display effect.
+
+    Args:
+        data (dict): _description_
     """
     human_msgs = data.get("human_messages", [])
     ai_msgs = data.get("ai_messages", [])
@@ -104,6 +172,24 @@ def print_response(data: dict):
         print()
 
 
+def quat_to_rpy(x: float, y: float, z: float, w: float):
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + + y * y)
+    roll = math.atan2(sinr_cosp, cosr_cosp)
+
+    sinp = 2.0 * (w * y - z * x)
+    if abs(sinp) >= 1.0:
+        pitch = math.copysign(math.pi / 2.0, sinp)
+    else:
+        pitch = math.asin(sinp)
+
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = math.atan2(siny_cosp, cosy_cosp)
+
+    return roll, pitch, yaw
+    
+
 def publish_to(type_name, topic_name: str, coordinates: list = None, msg: bool = None) -> None:
     """
     Publishes Coordinates to MoveIt
@@ -131,8 +217,18 @@ def publish_to(type_name, topic_name: str, coordinates: list = None, msg: bool =
     finally:
         publisher_node.destroy_node()
     
-
+    
+    
 def get_openai_api_key() -> str: 
+    """
+    Returns the OpenAI API key to connect with the Open Router server
+
+    Raises:
+        RuntimeError: FileNotFoundError (the api config file is missing) 
+
+    Returns:
+        str: API Key
+    """
     try:
         with open("openai_api_key.config", "r") as f:
             api_key = os.environ["OPENAI_API_KEY"] = f.read().strip()
@@ -143,6 +239,15 @@ def get_openai_api_key() -> str:
 
 
 def get_langsmith_api_key() -> str:
+    """
+    Returns the Langsmith API key to connect with the langsmith server to monitor agent statistics
+
+    Raises:
+        RuntimeError: FileNotFoundError (the api config file is missing) 
+
+    Returns:
+        str: API Key
+    """
     try:
         with open("langsmith_api_key.config", "r") as f:
             api_key = os.environ["LANGSMITH_API_KEY"] = f.read().strip()

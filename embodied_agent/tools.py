@@ -1,111 +1,84 @@
 import base64
-from langchain.messages import HumanMessage
-from std_msgs.msg import Float64MultiArray
+
 from langchain_core.tools import tool
 from .llm import get_llm
-from .utils.utils import publish_to
-
-COORDINATE_TYPE = Float64MultiArray
-COORDINATE_TOPIC = "published_coordinates"
-
-@tool(name_or_callable="multiply", description="Tool used to multiply numbers")
-def multiply(a: float | int, b: float | int) -> float | int:
-    """Multiply a and b.
-
-    Args:
-        a: first number
-        b: second number
-    """
-    return a * b
-
-@tool(name_or_callable="add", description="Tool used to add numbers")
-def add(a: float | int, b: float | int) -> float | int:
-    """Adds a and b.
-
-    Args:
-        a: first number
-        b: second number
-    """
-    return a + b
+from langchain.messages import HumanMessage
+from .utils.action_client import ExecuteMotionClient
+from .utils.utils import TfPoseLookup
 
 
-@tool(name_or_callable="divide", description="Tool used to divide numbers")
-def divide(a: float | int, b: float | int) -> float | int:
-    """Divide a and b.
 
-    Args:
-        a: first number
-        b: second number
-    """
-    return a / b
+def get_tools(node):
+    motion = ExecuteMotionClient(action_name="/execute_motion", expected_joint_len=7)
+    tf_lookup = TfPoseLookup(node)
+
+   
+    @tool(name_or_callable="move_to_home_pose", description="Send a joint target. Expects 6 joint values. Returns success/failure + feedback trace.")
+    def move_to_home_pose():
+        data = [0.0, 0.0, -0.7650, -3.15, -2.13, 0.006, -1.2, 1.55]
+        return motion.send(data)
 
 
-@tool(name_or_callable="describe_what_you_see", description="Takes an Image and parses it to the VLM for a description")
-def describe_what_you_see():
-    """
-    Capture an image and parse it to the language model to be described
-    """
-    image_path = "test_image.jpg"
-    model = get_llm()
+    @tool(name_or_callable="move_to_pose", description="Send a pose target (x,y,z,qx,qy,qz,qw). Returns success/failure + feedback trace.")
+    def move_to_pose(x: float, y: float, z: float, qx: float, qy: float, qz: float, qw: float):
+        data = [1.0, x, y, z, qx, qy, qz, qw]
+        return motion.send(data)
 
-    with open(image_path, "rb") as f:
-        image_bytes = f.read()
-        image_data = base64.b64encode(image_bytes).decode("utf-8")
-        
-    message = HumanMessage(
-        content=[
-            {"type": "text", "text": "describe the "},
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{image_data}"},
-            },
-        ]
-    )
 
-    ai_msg = model.invoke([message])
-    return ai_msg.content
+    @tool(name_or_callable="close_the_gripper", description="Closes the Gripper")
+    def close_the_gripper():
+        data = [2.0, 0.8]
+        return motion.send(data)
+
+
+    @tool(name_or_callable="open_the_gripper", description="Opens the Gripper")
+    def open_the_gripper():
+        data = [2.0, -0.0]
+        return motion.send(data)
+
+
+    @tool(name_or_callable="move_forward", description="Moves the robot forward by a specified amount")
+    def move_forward(distance: float | int, x: float, y: float, z: float, qx: float, qy: float, qz: float, qw: float):
+        data = [1.0, x, y, z, qx, qy, qz, qw]
+        return motion.send(data)
+
     
-        
-@tool(name_or_callable="go_to_home pose", description="Move the robot to a predefined position as a default pose")
-def go_to_home_pose():
-    """
-    Move the Arm to a predefined home position
-    """
-    home_pose_coordinates = [0.0, 0.0, -0.7650, -3.15, -2.13, 0.006, -1.2, 1.55]
-    # home_pose_coordinates = [1.0, 0.28, -0.2, 0.5, 0.0, 1.0, 0.0, 0.0]
+    @tool(name_or_callable="get_current_pose", description="Get the current pose of the robot")
+    def get_current_pose(base_frame: str = "base_link", ee_frame: str = "end_effector_link", timeout_s: float = 1.0):
+        return tf_lookup.get_pose(base_frame, ee_frame, timeout_s)
+    
+    
+    @tool(name_or_callable="describe_what_you_see", description="Takes an Image and parses it to the VLM for a description")
+    def describe_what_you_see():
+        """
+        Capture an image and parse it to the language model to be described
+        """
+        image_path = "test_image.jpg"
+        model = get_llm()
 
-    publish_to(type_name=COORDINATE_TYPE, topic_name=COORDINATE_TOPIC, coordinates=home_pose_coordinates)
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+            image_data = base64.b64encode(image_bytes).decode("utf-8")
+            
+        message = HumanMessage(
+            content=[
+                {"type": "text", "text": "describe the "},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{image_data}"},
+                },
+            ]
+        )
 
-
-@tool(name_or_callable="open_gripper", description="opens the gripper")
-def open_gripper():
-    """
-    Opens the Gripper
-    """
-    open_coordinates = [2.0, -0.0, 0.0]
-    publish_to(type_name=COORDINATE_TYPE, topic_name=COORDINATE_TOPIC, coordinates=open_coordinates)
-
-
-@tool(name_or_callable="close_gripper", description="closes the gripper")
-def close_gripper():
-    """
-    Closes the Gripper
-    """
-    close_coordinates = [2.0, -0.8, 0.8]
-    publish_to(type_name=COORDINATE_TYPE, topic_name=COORDINATE_TOPIC, coordinates=close_coordinates)
+        ai_msg = model.invoke([message])
+        return ai_msg.content
     
 
-def get_tools():
-    tools=[             
-        describe_what_you_see,
-        go_to_home_pose,
-        open_gripper,
-        close_gripper,
-        add,
-        multiply,
-        divide
-        ]
-    
-    return tools
-    
 
+    return [move_to_home_pose,
+            move_to_pose, 
+            move_forward,
+            close_the_gripper, 
+            open_the_gripper,
+            get_current_pose,
+            describe_what_you_see]

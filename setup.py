@@ -24,7 +24,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'embodied_agent = embodied_agent.agent_node:main'
+            'embodied_agent = embodied_agent.agent_node:main',
+            'logger = embodied_agent.logger:main', 
+            'motion_client = embodied_agent.utils.action_client:main'
         ],
     },
 )

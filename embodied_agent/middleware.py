@@ -23,7 +23,6 @@ def dynamic_model_selection():
     pass
 
 
-
 @wrap_tool_call
 def handle_tool_errors(request, handler):
     """Handle tool execution errors with custom messages."""
@@ -34,3 +33,4 @@ def handle_tool_errors(request, handler):
                         content=f"Tool error: Please check your input and try again. ({str(e)})",
             tool_call_id=request.tool_call["id"]
         )
+
