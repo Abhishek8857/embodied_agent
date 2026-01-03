@@ -1,5 +1,6 @@
 import rclpy
 import os
+import threading
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile
@@ -12,7 +13,7 @@ from .context import Context
 
 class Agent(Node):
     def __init__(self):
-        super().__init__("Embodied_Agent")
+        super().__init__("embodied_agent")
         qos_profile: QoSProfile = QoSProfile(depth=1, durability=QoSDurabilityPolicy.VOLATILE)
         self.subscription = self.create_subscription(String, "query", self.query_callback, qos_profile=qos_profile)
         tools = get_tools(self)
@@ -32,20 +33,27 @@ class Agent(Node):
         
         # Confirm message recieved from the user    
         self.get_logger().info(f"User Query: '{msg.data}'")
-        
-        # Invoke the Agent with user query and handle failure
+                
+        threading.Thread(target=self.handle_query, 
+                            args=(msg.data,), 
+                            daemon=True).start()
+
+
+    def handle_query(self, user_query: str):
         try:
-            self.get_logger().info(f"Invoking Agent with User Query {msg.data}")
-            
+            self.get_logger().info(f"Invoking Agent with User Query: {user_query}")
+
             response = self.agent.invoke(
-                format_message(msg.data), 
-                config=get_config(), 
-                context={"user_role": "beginner"})    
-            
+                format_message(user_query),
+                config=get_config(),
+                context={"user_role": "beginner"},
+            )
+
             print_response(format_response(response))
-        
+
         except Exception as e:
-            self.get_logger().info(f"Error executing User Query: {e}")
+            self.get_logger().error(f"Error executing User Query: {e}")
+
         finally:
             self.message_recieved = False
             self.get_logger().info("Waiting for the next message...\n")

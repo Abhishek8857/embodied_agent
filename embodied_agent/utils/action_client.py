@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """
-execute_motion_client.py
-
 Blocking (synchronous) ROS 2 Action client for `agent_action_interface/action/ExecuteMotion`.
 
 Designed to be called from an AI agent tool layer:

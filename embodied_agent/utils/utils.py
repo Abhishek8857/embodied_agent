@@ -2,73 +2,28 @@ import os
 import math
 import rclpy
 import tf2_ros
+import threading
+import time
 
+from typing import Dict, Optional, Any
 from rclpy.duration import Duration
 from rclpy.time import Time
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+from rclpy.callback_groups import ReentrantCallbackGroup
 from dataclasses import dataclass
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from .nodes import AgentPublisher
 from std_msgs.msg import Float64MultiArray, Bool
+from sensor_msgs.msg import JointState
+from tf2_msgs.msg import TFMessage
 
 
 @dataclass
 class Context:
     """Custom runtime context schema."""
     user_id: str
-
-
-class TfPoseLookup:
-    """Keeps a TF buffer/listener and provides pose lookup as a dict."""
-    def __init__(self, node, cache_time_s: float = 10.0):
-        self.node = node
-        self.buffer = tf2_ros.Buffer(cache_time=Duration(seconds=float(cache_time_s)))
-        # spin_thread=True keeps TF updates flowing even if tools block briefly
-        self.listener = tf2_ros.TransformListener(self.buffer, node, spin_thread=True)
-
-    def get_pose(self, base_frame: str, ee_frame: str, timeout_s: float = 1.0):
-        try:
-            ok = self.buffer.can_transform(
-                base_frame, ee_frame, Time(),
-                timeout=Duration(seconds=float(timeout_s)),
-            )
-            if not ok:
-                return {
-                    "success": False,
-                    "error_code": "TF_TIMEOUT",
-                    "error_description": f"TF not available: {base_frame} <- {ee_frame} (timeout {timeout_s}s)",
-                }
-
-            tf = self.buffer.lookup_transform(
-                base_frame, ee_frame, Time(),
-                timeout=Duration(seconds=float(timeout_s)),
-            )
-
-            t = tf.transform.translation
-            q = tf.transform.rotation
-            roll, pitch, yaw = quat_to_rpy(q.x, q.y, q.z, q.w)
-
-            return {
-                "success": True,
-                "base_frame": base_frame,
-                "ee_frame": ee_frame,
-                "translation": {"x": float(t.x), "y": float(t.y), "z": float(t.z)},
-                "quaternion": {"x": float(q.x), "y": float(q.y), "z": float(q.z), "w": float(q.w)},
-                "rpy_rad": {"r": float(roll), "p": float(pitch), "y": float(yaw)},
-                "rpy_deg": {"r": float(roll * 180.0 / math.pi),
-                            "p": float(pitch * 180.0 / math.pi),
-                            "y": float(yaw * 180.0 / math.pi)},
-            }
-
-        except (tf2_ros.LookupException,
-                tf2_ros.ConnectivityException,
-                tf2_ros.ExtrapolationException) as e:
-            return {
-                "success": False,
-                "error_code": "TF_LOOKUP_FAILED",
-                "error_description": str(e),
-            }
             
-
+        
 def format_message (msg: str) -> dict:
     return {"messages": [{"role" : "user" , "content": msg}]}
 
@@ -217,10 +172,9 @@ def publish_to(type_name, topic_name: str, coordinates: list = None, msg: bool =
     finally:
         publisher_node.destroy_node()
     
-    
-    
+
 def get_openai_api_key() -> str: 
-    """
+    """00
     Returns the OpenAI API key to connect with the Open Router server
 
     Raises:
