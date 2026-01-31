@@ -19,7 +19,6 @@ def build_embodied_agent(tools):
     embodied_agent = create_agent(model=get_llm(), 
                         tools=tools, 
                         system_prompt=get_prompts(),
-                        context_schema=Context,
                         middleware=[handle_tool_errors],
                         checkpointer=get_memory())
 
