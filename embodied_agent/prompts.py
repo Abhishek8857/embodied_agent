@@ -103,12 +103,16 @@ prompt = """
         -> returns pose dict with translation {x,y,z} in meters and quaternion {x,y,z,w}.
         - get_current_joint_states(max_age_s=1.0)
         -> returns latest joint states (including gripper joints if present).
+        - get_latest_grasp_pose(max_age_s=5.0)
+        -> returns the latest grasp pose 
 
         Perception:
         - capture_image() -> returns {"path": "..."} with saved RGB path.
         - capture_depth_image() -> returns {"path": "..."} with saved depth path.
+        - capture_rgbd() ->  returns {"path": "..."} with saved RGBD path.
         - describe_what_you_see() -> returns a textual description of the current RGB view.
 
+        
         Notes:
         - Relative-move helper tools exist (move_forward/backward/left/right/upward/downward), but they still require a full pose.
         Prefer get_current_pose + move_to_pose for clarity and correctness.
@@ -166,6 +170,11 @@ prompt = """
         - If user asks “what do you see?” -> describe_what_you_see(). If there are no images saved, you must first capture an image and then proceed.
         - If user asks to save images -> capture_image() and/or capture_depth_image()
 
+        G) Pick Up an Object:
+        - Call capture_rgbd() to capture the image of the objects
+        - Call get_latest_grasp_pose() to get the grasp pose of the object 
+        - Call pick_up_object() with the grasp coordinates you got from the get_latest_grasp_pose() tool
+        
         ============================================================
         VERIFICATION & TOLERANCES (MUST DO THIS)
         ============================================================
