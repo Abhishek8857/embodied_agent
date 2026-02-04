@@ -174,7 +174,7 @@ def publish_to(type_name, topic_name: str, coordinates: list = None, msg: bool =
     
 
 def get_openai_api_key() -> str: 
-    """00
+    """
     Returns the OpenAI API key to connect with the Open Router server
 
     Raises:
@@ -207,5 +207,24 @@ def get_langsmith_api_key() -> str:
             api_key = os.environ["LANGSMITH_API_KEY"] = f.read().strip()
     except FileNotFoundError:
         raise RuntimeError("Missing langsmith_api_key.config file")
+    
+    return api_key
+
+def get_gemini_api_key() -> str:
+    """
+    Returns Gemini API Key required to invoke gemini for image segmentation
+
+    Raises:
+        RuntimeError: FileNotFoundError (api config file is missing)
+        
+    Returns:
+        str: API Key
+    """
+    
+    try:
+        with open("gemini_api_key.config", "r") as f:
+            api_key = os.environ["GEMINI_API_KEY"] = f.read().strip()
+    except FileNotFoundError:
+        raise RuntimeError("Missing geminie_api_key.config file")
     
     return api_key

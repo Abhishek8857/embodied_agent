@@ -93,7 +93,7 @@ class OneShotCameraInfoSubscriber:
 def capture_rgbd_npz(
     node,
     save_dir: str = "captures/rgbd",
-    filename: str = "rgbd_image.npz",
+    filename: str = "rgbd.npz",
     rgb_topic: str = "/camera/color/image_raw",
     depth_topic: str = "/camera/depth/image_rect_raw",
     camera_info_topic: str = "/camera/color/camera_info",
@@ -126,7 +126,8 @@ def capture_rgbd_npz(
     if info_msg is None:
         raise TimeoutError(f"No CameraInfo received on '{camera_info_topic}' within {timeout_s}s")
 
-    rgb = bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="bgr8")
+    bgr = bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="bgr8")
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     depth_raw = bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
     depth_np = np.array(depth_raw)
 

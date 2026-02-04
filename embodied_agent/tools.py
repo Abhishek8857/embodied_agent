@@ -8,6 +8,7 @@ from .utils.tf_pose import TfPoseLookup
 from .utils.joint_state_cache import JointStateCache
 from .utils.capture import *
 from .utils.grasp_pose_cache import GraspPoseCache
+from .utils.gemini_segmentor import GeminiSegmentor
 
 
 
@@ -16,7 +17,8 @@ def get_tools(node):
     tf_lookup = TfPoseLookup(node)
     joint_state_lookup = JointStateCache(node, topic="/isaac_joint_states")
     grasp_pose_lookup = GraspPoseCache(node, topic="/grasp_pose")
-   
+    segmentor = GeminiSegmentor()
+    
     @tool(name_or_callable="move_to_home_pose", description="Send a joint target. Expects 7 joint values. Returns success/failure + feedback trace.")
     def move_to_home_pose():
         data = [0.0, 0.049, -0.4882, 3.1227, -2.0745, 0.0112, -0.9870, 1.55]
@@ -170,7 +172,16 @@ def get_tools(node):
             timeout_s=2.0,
         )
 
+    @tool(name_or_callable="segment_objects", description="Segment objects in the scene by natural language query (e.g. 'blue objects', 'the red cup')." 
+                                                          "Requires capture_rgbd to have been called first. Returns label, bounding box, and 3D grasp center for each detected object.")
+    def segment_objects(query: str):
+        """
+        Args:
+            query: What to segment, e.g. "blue objects", "the red cup"
+        """
+        return segmentor.segment("captures/rgbd/rgbd_image.npz", query)
     
+
     @tool(name_or_callable="describe_what_you_see", description="Takes an Image and parses it to the VLM for a description")
     def describe_what_you_see():
         """
@@ -210,6 +221,7 @@ def get_tools(node):
             close_the_gripper, 
             open_the_gripper,
             get_current_pose,
+            segment_objects,
             get_current_joint_states,
             describe_what_you_see,
             capture_only_rgb_image,
