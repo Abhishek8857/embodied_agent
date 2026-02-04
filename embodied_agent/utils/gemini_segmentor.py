@@ -9,7 +9,7 @@ from PIL import Image
 
 from google import genai
 from google.genai import types
-from .utils import get_openai_api_key
+from .utils import get_gemini_api_key
 
 class GeminiSegmentor:
     """
@@ -25,10 +25,10 @@ class GeminiSegmentor:
         results = segmentor.segment("captures/rgbd/rgbd_image.npz", "blue cube")
     """
 
-    MODEL_NAME = "gemini-3-pro-preview"
+    MODEL_NAME = "gemini-robotics-1.5-er-preview"
 
     def __init__(self):
-        self._client = genai.Client(api_key=get_openai_api_key())
+        self._client = genai.Client(api_key=get_gemini_api_key())
 
 
     def segment(self, npz_path: str, query: str,
