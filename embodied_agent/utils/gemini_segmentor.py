@@ -25,7 +25,7 @@ class GeminiSegmentor:
         results = segmentor.segment("captures/rgbd/rgbd_image.npz", "blue cube")
     """
 
-    MODEL_NAME = "gemini-robotics-1.5-er-preview"
+    MODEL_NAME = "gemini-robotics-er-1.5-preview"
 
     def __init__(self):
         self._client = genai.Client(api_key=get_gemini_api_key())
@@ -202,14 +202,14 @@ class GeminiSegmentor:
             full_mask[y0:y1, x0:x1] = mask_array
 
             # Compute 3D grasp center from mask + depth
-            grasp_3d = self._compute_grasp_center(full_mask, depth, fx, fy, cx, cy)
+            # grasp_3d = self._compute_grasp_center(full_mask, depth, fx, fy, cx, cy)
 
             results.append({
                 "label":           item["label"],
                 "box_pixels":      {"x_min": x0, "y_min": y0, "x_max": x1, "y_max": y1},
                 "mask":            full_mask,           # Boolean numpy array (H, W)
                 "mask_array":      full_mask.astype(np.uint8) * 255,  # uint8 for saving/viewing
-                "grasp_center_3d": grasp_3d,
+                # "grasp_center_3d": grasp_3d,
             })
 
         return results
