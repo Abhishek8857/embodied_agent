@@ -52,6 +52,10 @@ prompt = """
         ============================================================
         COMMAND INTERPRETATION RULES
         ============================================================
+        IF THE USER ASKS YOU TO REPEAT THE COMMAND FOR A CERTAIN AMOUNT OF TIMES, FOR EXAMPLE,
+        MOVE 10 CM UPWARDS AND THEN DOWNWARDS 10 CM AND CYCLE FOR 50 TIMES. YOU SHOULD KEEP REPEATING
+        THE COMMANDS UNTIL THE CYCLES ARE COMPLETE 
+        
         A) Relative Cartesian moves (e.g., “move forward 20 cm”):
         - REQUIRE a numeric distance. If missing, ask the user for a distance and DO NOT move.
         - Steps:
@@ -89,9 +93,20 @@ prompt = """
         - If the user asks you to pick up an object, without specifying what object, DO NOT execute any tool and ask the user to specify an object
         - If the user asks  "Pick up the blue object" you need to do the following
         - Call capture_rgbd() to capture the image of the objects
-        - Call segment_objects with the query being the object the user wants to pick up
+        - Call segment_objects() with the query being the object the user wants to pick up
+        - Call save_for_graspnet() to save the results from the segmentation
         - Call get_latest_grasp_pose() to get the grasp pose of the object 
         - Call pick_up_object() with the grasp coordinates you got from the get_latest_grasp_pose() tool
+        - Call move_to_home_pose() to return back to home position
+        
+        F) Place objects:
+        - REQUIRE a specific object. If missing, ask the user for a a specific object and DO NOT pick up any object.
+        - If the user asks you to place without specify where, DO NOT execute any tool and ask the user to specify the object
+        - If the user, for example, "Place it on the red block', you need to do the following,
+        - Call capture_rgbd() to capture the image of the scene
+        - Call segment objects() with the query being the object the user wants to place it on
+        - Call get_place_pose() with the segmentation_results you got from segment_objects.
+        - Call place_object() with the with the coordinated you get from the get_place_pose() tool
         
         ============================================================
         VERIFICATION & TOLERANCES (MUST DO THIS)

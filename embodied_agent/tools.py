@@ -4,12 +4,13 @@ from langchain_core.tools import tool
 from .llm import get_llm
 from langchain.messages import HumanMessage
 from .utils.action_client import ExecuteMotionClient
-from .utils.tf_pose import TfPoseLookup
+from .utils.tf_pose_lookup import TfPoseLookup
 from .utils.joint_state_cache import JointStateCache
 from .utils.capture import *
 from .utils.grasp_pose_cache import GraspPoseCache
 from .utils.gemini_segmentor import GeminiSegmentor
-
+from .utils.calculate_place_pose import get_placement_pose
+from .utils.save_graspnet_image import save_graspnet_image
 
 
 def get_tools(node):
@@ -18,6 +19,11 @@ def get_tools(node):
     joint_state_lookup = JointStateCache(node, topic="/isaac_joint_states")
     grasp_pose_lookup = GraspPoseCache(node, topic="/grasp_pose")
     segmentor = GeminiSegmentor()
+    
+    # Created a shared state to pass data between tools without requiring the agent to pass large amounts of data
+    _state = {
+        "last_segmentation": None,
+    }
     
     @tool(name_or_callable="move_to_home_pose", description="Send a joint target. Expects 7 joint values. Returns success/failure + feedback trace.")
     def move_to_home_pose():
@@ -142,7 +148,57 @@ def get_tools(node):
         data = [3.0, x, y, z, qx, qy, qz, qw, pre_grasp_offset, lift_height]
         return motion.send(data)    
     
-    
+    @tool(name_or_callable="save_segmentation_for_graspnet",
+          description="Save segmentation results in Contact-GraspNet format. Call this after segment_objects, then run Contact-GraspNet externally to generate grasp poses.")
+    def save_for_graspnet():
+        """
+        Saves segmentation to /ros-ai-agent/captures/segmentation/rgbd_sgmtd/rgbd_sgmtd.npz
+        in the format Contact-GraspNet expects (depth, segmap, K, rgb).
+                
+        Returns:
+            Success status and file path
+        """
+        if _state["last_segmentation"] == None:
+            return {"success": False, "error": "No segmentation results found, call segment_objects() first."}
+        
+        return save_graspnet_image(
+            _state["last_segmentation"],
+            rgbd_path="captures/rgbd/rgbd_image.npz",
+            output_path="/ros-ai-agent/captures/segmentation/rgbd_sgmtd/rgbd_sgmtd.npz"
+        )
+
+    @tool(name_or_callable="get_place_pose", 
+          description="Get placement pose on top of the segmented object. Use after segment_objects to get the pose for placing an object. Returns x,y,z,qx,qy,qz,qw ready for place_object")
+    def get_place_pose(base_frame: str, ee_frame: str, timeout_s: float, target_object_label: str = None, height_offset: float = 0.2,):
+        """
+        Extract placement pose from segmentation results. Uses the placement_surface_3d
+        that was computed during segmentation.
+        
+        Args:
+            segmentation_results: Output from segment_objects
+            target_object_label: Which object to place on (e.g., "red cube"). If None, uses first object.
+            height_offset: Clearance above surface in meters (default: 0.2 = 20cm)
+        
+        Returns:
+            {"success": True, "x", "y", "z", "qx", "qy", "qz", "qw", "object_label"}
+        """
+        if _state["last_segmentation"] == None:
+            return {"success": False, "error": "No segmentation results found. Call segment_objects first."}
+        
+        base_frame = "base_link"      
+        ee_frame = "camera_link"    
+        timeout_s = timeout_s or 1.0                
+        
+        tf_transform = tf_lookup.get_pose(base_frame, ee_frame, timeout_s)
+        
+        return get_placement_pose(
+            _state["last_segmentation"],
+            target_object_label=target_object_label,
+            height_offset=height_offset, 
+            tf_transform=tf_transform,
+            apply_tf=True
+        )
+        
     @tool(name_or_callable="place_object", description="Place held object at specified pose (x,y,z,qx,qy,qz,qw). ")
     def place_object(x: float, y: float, z: float, qx: float, qy: float, qz: float, qw: float,retreat_distance: float = 0.15):
         """
@@ -179,7 +235,11 @@ def get_tools(node):
         Args:
             query: What to segment, e.g. "blue objects", "the red cup"
         """
-        return segmentor.segment("captures/rgbd/rgbd_image.npz", query)
+        result = segmentor.segment("captures/rgbd/rgbd_image.npz", query)
+        _state["last_segmentation"] = result # Cache
+        if _state["last_segmentation"] == None: 
+            return {"success": False, "error": "Something went wrong. Segmentation results not cached"}
+        return result
     
 
     @tool(name_or_callable="describe_what_you_see", description="Takes an Image and parses it to the VLM for a description")
@@ -222,6 +282,8 @@ def get_tools(node):
             open_the_gripper,
             get_current_pose,
             segment_objects,
+            save_for_graspnet,
+            get_place_pose,
             get_current_joint_states,
             describe_what_you_see,
             capture_only_rgb_image,

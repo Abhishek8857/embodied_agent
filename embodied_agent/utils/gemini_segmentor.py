@@ -34,7 +34,7 @@ class GeminiSegmentor:
     def segment(self, npz_path: str, query: str,
                 save_visualizations: bool = True,
                 output_dir: str = "captures/segmentation",
-                save_npz_with_segmap: bool = True,
+                save_npz_with_segmap: bool = False,
                 output_npz_path: str | None = None) -> dict:
         """
         Full pipeline: load .npz then segment with Gemini to get the 3D back-projection.
@@ -201,15 +201,19 @@ class GeminiSegmentor:
             full_mask = np.zeros((H, W), dtype=bool)
             full_mask[y0:y1, x0:x1] = mask_array
 
-            # Compute 3D grasp center from mask + depth
-            # grasp_3d = self._compute_grasp_center(full_mask, depth, fx, fy, cx, cy)
+            # Compute 3D grasp center (centroid of all pixels)
+            grasp_3d = self._compute_grasp_center(full_mask, depth, fx, fy, cx, cy)
+            
+            # Compute 3D placement surface (top surface for placing on)
+            placement_3d = self._compute_placement_surface(full_mask, depth, fx, fy, cx, cy)
 
             results.append({
-                "label":           item["label"],
-                "box_pixels":      {"x_min": x0, "y_min": y0, "x_max": x1, "y_max": y1},
-                "mask":            full_mask,           # Boolean numpy array (H, W)
-                "mask_array":      full_mask.astype(np.uint8) * 255,  # uint8 for saving/viewing
-                # "grasp_center_3d": grasp_3d,
+                "label":              item["label"],
+                "box_pixels":         {"x_min": x0, "y_min": y0, "x_max": x1, "y_max": y1},
+                "mask":               full_mask,           # Boolean numpy array (H, W)
+                "mask_array":         full_mask.astype(np.uint8) * 255,  # uint8 for saving/viewing
+                "grasp_center_3d":    grasp_3d,           # Centroid (for grasping)
+                "placement_surface_3d": placement_3d,      # Top surface (for placing on)
             })
 
         return results
@@ -240,8 +244,57 @@ class GeminiSegmentor:
             "x": round(float(X.mean()), 4),
             "y": round(float(Y.mean()), 4),
             "z": round(float(Z.mean()), 4),
-        }
+        }  
 
+
+    def _compute_placement_surface(self, mask, depth, fx, fy, cx, cy,
+                                    surface_depth_percentile: float = 5.0):
+        """
+        Stable placement point in CAMERA frame.
+        
+        For DOWNWARD-FACING cameras (looking down at workspace):
+        - Use LOW percentile (5th) to get NEAREST surface
+        - This is the TOP of the object (what camera sees first)
+        - This is the correct placement surface
+        
+        For FORWARD-FACING cameras (looking horizontally):
+        - Use HIGH percentile (95th) to get FARTHEST surface  
+        - This is the BOTTOM/support surface of the object
+        
+        Note: The percentile should match your camera mounting orientation.
+        """
+
+        ys, xs = np.where(mask)
+        if xs.size < 20:
+            return {"x": 0.0, "y": 0.0, "z": 0.0}
+
+        zs = depth[ys, xs].astype(np.float32)
+        valid = np.isfinite(zs) & (zs > 0.05) & (zs < 5.0)
+
+        if valid.sum() < 20:
+            return {"x": 0.0, "y": 0.0, "z": 0.0}
+
+        xs_v = xs[valid].astype(np.float32)
+        ys_v = ys[valid].astype(np.float32)
+        zs_v = zs[valid].astype(np.float32)
+
+        # Stable image-space center
+        u = float(np.median(xs_v))
+        v = float(np.median(ys_v))
+
+        # Robust depth - percentile depends on camera orientation
+        z = float(np.percentile(zs_v, surface_depth_percentile))
+
+        # Standard Pinhole Camera Model
+        X = (u - cx) * z / fx
+        Y = (v - cy) * z / fy
+        Z = z
+
+        # CRITICAL FIX: Negate X and Y to match your camera's frame convention
+        # Your depth camera uses a non-standard optical frame where both axes are flipped
+        # Standard optical: X=right, Y=down, Z=forward
+        # Your camera: X=left, Y=up, Z=forward (effectively)
+        return {"x": float(X), "y": float(Y), "z": float(Z)}
 
     @staticmethod
     def _save_visualizations(rgb: np.ndarray, results: list[dict], 
