@@ -169,7 +169,7 @@ def get_tools(node):
 
     @tool(name_or_callable="get_place_pose", 
           description="Get placement pose on top of the segmented object. Use after segment_objects to get the pose for placing an object. Returns x,y,z,qx,qy,qz,qw ready for place_object")
-    def get_place_pose(base_frame: str, ee_frame: str, timeout_s: float, target_object_label: str = None, height_offset: float = 0.2,):
+    def get_place_pose(base_frame: str, ee_frame: str, timeout_s: float, target_object_label: str = None, height_offset: float = 0.175  ,):
         """
         Extract placement pose from segmentation results. Uses the placement_surface_3d
         that was computed during segmentation.
@@ -186,7 +186,7 @@ def get_tools(node):
             return {"success": False, "error": "No segmentation results found. Call segment_objects first."}
         
         base_frame = "base_link"      
-        ee_frame = "camera_link"    
+        ee_frame = "camera_depth_frame"    
         timeout_s = timeout_s or 1.0                
         
         tf_transform = tf_lookup.get_pose(base_frame, ee_frame, timeout_s)

@@ -2,11 +2,12 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 
+
 def get_placement_pose(
     segmentation_results: dict,
     target_object_label: str = None,
     object_index: int = 0,
-    height_offset: float = 0.2,  # Increased from 0.03 for better clearance
+    height_offset: float = 0.05,  # Reduced for better accuracy (was 0.2)
     gripper_orientation: str = "downward",
     tf_transform: dict = None,
     apply_tf: bool = True,
@@ -75,10 +76,13 @@ def get_placement_pose(
             "error": f"Object '{target_obj['label']}' has no placement_surface_3d. Did segmentation fail?"
         }
     
+
+    
     # Extract camera-frame position
-    x = float(surface_pose["x"])
+    x = float(surface_pose["x"]) 
     y = float(surface_pose["y"])
     z_surface = float(surface_pose["z"])
+
 
     # Apply TF transform if requested
     if apply_tf:
@@ -88,8 +92,8 @@ def get_placement_pose(
         t = tf_transform["translation"]
         q = tf_transform["quaternion"]
 
-        # CRITICAL FIX: Use DIRECT transform, not inverse
-        # The TF appears to be camera→base, so: p_base = R @ p_cam + t
+        # Use DIRECT transform, not inverse
+        # The TF appears to be camera to base, so: p_base = R @ p_cam + t
         R_transform = Rotation.from_quat([q["x"], q["y"], q["z"], q["w"]])
         t_transform = np.array([t["x"], t["y"], t["z"]], dtype=float)
         
@@ -98,13 +102,24 @@ def get_placement_pose(
         print(f"[DEBUG] Camera optical frame: x={x:.4f}, y={y:.4f}, z={z_surface:.4f}")
         print(f"[DEBUG] TF translation: {t_transform}")
         
-        # Apply DIRECT transform (not inverse!)
+        # Apply transform
         p_base = R_transform.apply(p_cam) + t_transform
-        
-        print(f"[DEBUG] Base frame (direct transform): x={p_base[0]:.4f}, y={p_base[1]:.4f}, z={p_base[2]:.4f}")
-        
         x, y, z_surface = float(p_base[0]), float(p_base[1]), float(p_base[2])
         
+        
+        X_OFFSET = 0.025
+        Y_OFFSET_LEFT = 0.020
+        Y_OFFSET_RIGHT = 0.05
+        
+        
+        x += X_OFFSET
+        
+        if y > 0.0:
+            y -= Y_OFFSET_LEFT
+        else:
+            y -= Y_OFFSET_RIGHT
+            
+            
         # Sanity check
         if x < -0.2 or x > 0.8:
             print(f"[WARNING] X={x:.4f} is outside typical reach range [-0.2, 0.8]")

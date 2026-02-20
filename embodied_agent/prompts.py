@@ -96,8 +96,8 @@ prompt = """
         - Call segment_objects() with the query being the object the user wants to pick up
         - Call save_for_graspnet() to save the results from the segmentation
         - Call get_latest_grasp_pose() to get the grasp pose of the object 
-        - Call pick_up_object() with the grasp coordinates you got from the get_latest_grasp_pose() tool
-        - Call move_to_home_pose() to return back to home position
+        - Call pick_up_object() with the grasp coordinates you got from the get_latest_grasp_pose() tool 
+        - Always Call move_to_home_pose() to return back to home position after picking up
         
         F) Place objects:
         - REQUIRE a specific object. If missing, ask the user for a a specific object and DO NOT pick up any object.
@@ -107,6 +107,7 @@ prompt = """
         - Call segment objects() with the query being the object the user wants to place it on
         - Call get_place_pose() with the segmentation_results you got from segment_objects.
         - Call place_object() with the with the coordinated you get from the get_place_pose() tool
+        - Call move_to_home_pose() to return back to the home position
         
         ============================================================
         VERIFICATION & TOLERANCES (MUST DO THIS)
