@@ -39,27 +39,33 @@ def format_response(msg: dict) -> dict:
         dict: Formatted response in a dictionary format with human_messages, ai_messages, final_response as keys.
     """
     data = msg["messages"]
-    human_messages: list = []
-    ai_messages: list = []
-    tool_calls: list = []
-    final_response: list = []
-    
+    human_messages, ai_messages, tool_calls, final_response = [], [], [], []
+
     for obj in data:
         if isinstance(obj, HumanMessage):
             human_messages.append({"content": obj.content})
-        
-        if isinstance(obj, AIMessage):
-            if obj.content != '':
-                final_response.append({"content": obj.content})
-            else:
-                ai_messages.append(obj.tool_calls[0])
-        
-        if isinstance(obj, ToolMessage):
-            tool_calls.append({"tool": obj.name, "output": obj.content, "tool_call_id": obj.tool_call_id})
-    
-    
-    return {"human_messages": human_messages, "tool_calls": tool_calls, "ai_messages": ai_messages, "final_response": final_response}             
 
+        elif isinstance(obj, AIMessage):
+            # final text
+            if obj.content and obj.content.strip():
+                final_response.append({"content": obj.content})
+            # tool calls (can be multiple)
+            if getattr(obj, "tool_calls", None):
+                ai_messages.extend(obj.tool_calls)
+
+        elif isinstance(obj, ToolMessage):
+            tool_calls.append({
+                "tool": obj.name,
+                "output": obj.content,
+                "tool_call_id": obj.tool_call_id
+            })
+
+    return {
+        "human_messages": human_messages,
+        "tool_calls": tool_calls,
+        "ai_messages": ai_messages,
+        "final_response": final_response
+    }
 
 def print_response(data: dict):
     """    

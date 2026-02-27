@@ -242,10 +242,13 @@ def get_tools(node):
         return result
     
 
-    @tool(name_or_callable="describe_what_you_see", description="Takes an Image and parses it to the VLM for a description")
-    def describe_what_you_see():
+    @tool(name_or_callable="describe_environment", description="Use after capture_only_rgb_image() and parse the saved image to the VLM for a description")
+    def describe_environment(query: str):
         """
         Capture an image and parse it to the language model to be described
+        
+        Args:
+            query: What specific part of the image needs to be described
         """
         image_path = "captures/rgb/rgb.jpg"
         model = get_llm()
@@ -256,7 +259,7 @@ def get_tools(node):
             
         message = HumanMessage(
             content=[
-                {"type": "text", "text": "describe the image in detail "},
+                {"type": "text", "text": query},
                 {
                     "type": "image_url",
                     "image_url": {"url": f"data:image/jpeg;base64,{image_data}"},
@@ -285,7 +288,7 @@ def get_tools(node):
             save_for_graspnet,
             get_place_pose,
             get_current_joint_states,
-            describe_what_you_see,
+            describe_environment,
             capture_only_rgb_image,
             capture_only_depth_image,
             capture_rgbd, 
