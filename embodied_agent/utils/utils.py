@@ -231,6 +231,23 @@ def get_gemini_api_key() -> str:
         with open("gemini_api_key.config", "r") as f:
             api_key = os.environ["GEMINI_API_KEY"] = f.read().strip()
     except FileNotFoundError:
-        raise RuntimeError("Missing geminie_api_key.config file")
+        raise RuntimeError("Missing gemini_api_key.config file")
     
     return api_key
+
+def get_mistral_api_key():
+    """
+    Returns Mistral API Key required to invoke Mistral and other related models for agent 
+
+    Raises:
+        RuntimeError: FileNotFoundError (api config file is missing)
+        
+    Returns:
+        str: API Key
+    """
+    
+    try:
+        with open("mistral_api_key.config", "r") as f:
+            api_key = os.environ["CHATAI_API_KEY"] = f.read.strip()
+    except FileNotFoundError:
+        raise RuntimeError("Missing mistral_api_key.config file")

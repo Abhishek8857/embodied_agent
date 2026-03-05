@@ -131,6 +131,7 @@ class EpisodeRecorder:
         self._lock = threading.Lock()
         self._episode_counter = 0
         self._episodes: list[Episode] = []
+        self._seen_tool_call_ids: set[str] = set()  # cross-episode guard against LangGraph state carryover
 
         # One JSON file per session for easy human reading
         self._filepath = self.save_dir / f"{self.session_id}.json"
@@ -177,6 +178,9 @@ class EpisodeRecorder:
             args         = ai_msg.get("args", {})
             output_entry = tool_output_map.get(tool_call_id, {})
             output_str   = output_entry.get("output", "")
+            if tool_call_id in self._seen_tool_call_ids:
+                continue  # skip: carried over from a previous episode's LangGraph state
+            self._seen_tool_call_ids.add(tool_call_id)
             episode.add_tool_call(tool=tool_name, args=args, output=output_str,
                                   tool_call_id=tool_call_id)
 
