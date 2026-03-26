@@ -177,7 +177,27 @@ def publish_to(type_name, topic_name: str, coordinates: list = None, msg: bool =
         return
     finally:
         publisher_node.destroy_node()
-    
+        
+
+def relative_move(pose: dict, distance_x: float, distance_y: float) -> dict:
+    """
+    Convention: 0° = facing +X (forward), yaw increases counter-clockwise.
+    """
+    yaw_rad = math.radians(pose["yaw_degrees"])
+
+    # 0° faces +X, yaw counter-clockwise:
+    #   forward unit vector = ( cos(yaw), sin(yaw) )
+    #   left    unit vector = (-sin(yaw), cos(yaw) )
+    fwd_x =  math.cos(yaw_rad)
+    fwd_y =  math.sin(yaw_rad)
+    lft_x = -math.sin(yaw_rad)
+    lft_y =  math.cos(yaw_rad)
+
+    return {
+        "x":           pose["x"] + fwd_x * distance_x + lft_x * distance_y,
+        "y":           pose["y"] + fwd_y * distance_x + lft_y * distance_y,
+        "yaw_degrees": pose["yaw_degrees"],
+    }
 
 def get_openai_api_key() -> str: 
     """

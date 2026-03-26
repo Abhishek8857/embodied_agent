@@ -21,132 +21,122 @@ from pathlib import Path
 EPISODES_DIR = Path("episodes")
 MEMORY_DIR   = Path("memory")
 
-
 # ---------------------------------------------------------------------------
-# Failure detection — three complementary layers
+# Layer 1: Terminal tools — the tool that must have run for a task to be done
 # ---------------------------------------------------------------------------
-
-# # Layer 1: Terminal tools — must have been called AND succeeded for the task
-# # to be considered complete. Maps query keywords → completion tool name.
 # _REQUIRED_TOOLS = {
-#     "pick":  "pick_up_object",
-#     "place": "place_object",
-#     "move":  "move_to_pose",
-#     "open":  "open_the_gripper",
-#     "close": "close_the_gripper",
-# }
+#     "forward":    "move_forward",
+#     "backward":   "move_backward",
+#     "left":       "move_left",
+#     "right":      "move_right",
+#     "turn left":  "turn_left",
+#     "turn right": "turn_right",
+#     "go to":      "navigate_to_location",
+#     "navigate":   "navigate_to_pose",
+#     }
 
-# # Layer 2: Semantic intermediate tool checks — tools that can return
-# # success=true but still represent a domain failure blocking downstream steps.
-# def _check_segment_objects(data: dict) -> str | None:
-#     if data.get("count", 1) == 0 or data.get("objects") == []:
-#         msg = data.get("message", "no objects found")
-#         return f"segmentation returned no objects: {msg}"
-#     return None
+# ---------------------------------------------------------------------------
+# Layer 2: Semantic checks — all nav tools share the same response shape
+# ---------------------------------------------------------------------------
+_CHECKED_TOOLS = {
+    "navigate_to_pose",
+    "navigate_to_location",
+    "move_forward",
+    "move_backward",
+    "move_left",
+    "move_right",
+    "turn_left",
+    "turn_right",
+    "get_current_pose",
+}
 
-# def _check_get_latest_grasp_pose(data: dict) -> str | None:
-#     if not data.get("success"):
-#         return f"no valid grasp pose: {data.get('error', 'unknown')}"
-#     return None
+def _check_tool_result(tool_name: str, data: dict) -> str | None:
+    if not data.get("success"):
+        reason = data.get("message") or data.get("status") or "unknown error"
+        return f"'{tool_name}' failed: {reason}"
+    return None
 
-# _SEMANTIC_TOOL_CHECKS = {
-#     "segment_objects":       _check_segment_objects,
-#     "get_latest_grasp_pose": _check_get_latest_grasp_pose,
-# }
-
-# # Layer 3: Agent verification block — system prompt mandates "Result: SUCCESS"
-# # or "Result: FAILED", so this is template parsing, not free-text scanning.
-# _VERIFICATION_FAILED_RE  = re.compile(r"result\s*:\s*failed",  re.IGNORECASE)
-# _VERIFICATION_SUCCESS_RE = re.compile(r"result\s*:\s*success", re.IGNORECASE)
-
-
-# def _parse_tool_result(content) -> dict:
-#     try:
-#         return json.loads(content) if isinstance(content, str) else (content or {})
-#     except (json.JSONDecodeError, TypeError):
-#         return {}
+# ---------------------------------------------------------------------------
+# Layer 3: Agent verification block — mandated by system prompt
+# ---------------------------------------------------------------------------
+_VERIFICATION_FAILED_RE  = re.compile(r"result\s*:\s*failed",  re.IGNORECASE)
+_VERIFICATION_SUCCESS_RE = re.compile(r"result\s*:\s*success", re.IGNORECASE)
 
 
-# def _extract_failure(result: dict, query: str) -> str | None:
-#     """
-#     Return a failure description string if the task did not complete,
-#     or None if everything succeeded.
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _parse_tool_result(content) -> dict:
+    try:
+        return json.loads(content) if isinstance(content, str) else (content or {})
+    except (json.JSONDecodeError, TypeError):
+        return {}
 
-#     Layer 1 — Terminal tool check (structural):
-#         Did the tools representing task completion run and succeed?
-#         Catches: required tool never called because an earlier step aborted.
 
-#     Layer 2 — Semantic intermediate tool check:
-#         Did any intermediate tool return bad domain data despite success=true?
-#         Catches: segment_objects returning count=0, no grasp pose available.
+def _extract_failure(result: dict, query: str) -> str | None:
+    """
+    Return a failure description string if the navigation task did not complete,
+    or None if everything succeeded.
 
-#     Layer 3 — Agent verification block (template parsing):
-#         The system prompt forces "Result: SUCCESS / FAILED" in every action
-#         response. Scanning for this is reliable — it is not free-text.
-#         Catches: all physical outcome failures the agent itself detects,
-#                  e.g. place executed but visual check shows cube missed target.
-#     """
-#     messages = result.get("messages", [])
-#     query_lower = query.lower()
+    Layer 1 — Terminal tool check (structural):
+        Did the expected tool for this query run and return success=True?
+        Catches: required tool never called because an earlier step aborted.
 
-#     # --- Layer 1: did terminal tools run and succeed? ---
-#     for keyword, tool_name in _REQUIRED_TOOLS.items():
-#         if keyword not in query_lower:
-#             continue
+    Layer 2 — Semantic tool check:
+        Did any navigation tool return success=False?
+        Catches: Nav2 action server rejections, odometry failures, unknown locations.
 
-#         tool_msgs = [
-#             m for m in messages
-#             if isinstance(m, ToolMessage) and m.name == tool_name
-#         ]
+    Layer 3 — Agent verification block (template parsing):
+        The system prompt forces "Result: SUCCESS / FAILED" in every response.
+        Catches: all physical outcome failures the agent itself detects,
+                 e.g. robot missed target pose, outside tolerance.
+    """
+    messages    = result.get("messages", [])
+    query_lower = query.lower()
 
-#         if not tool_msgs:
-#             return f"'{tool_name}' was never executed"
+    # --- Layer 1: did the expected terminal tool run and succeed? ---
+    # for keyword, tool_name in _REQUIRED_TOOLS.items():
+    #     if keyword not in query_lower:
+    #         continue
 
-#         data = _parse_tool_result(tool_msgs[-1].content)
-#         succeeded = (
-#             data.get("success") is True
-#             or data.get("final_status") == "SUCCEEDED"
-#             or data.get("error_code") == "SUCCESS"
-#         )
-#         if not succeeded:
-#             reason = (
-#                 data.get("error")
-#                 or data.get("error_description")
-#                 or data.get("message")
-#                 or "unknown error"
-#             )
-#             return f"'{tool_name}' failed: {reason}"
+    #     tool_msgs = [
+    #         m for m in messages
+    #         if isinstance(m, ToolMessage) and m.name == tool_name
+    #     ]
 
-#     # --- Layer 2: did intermediate tools return bad domain data? ---
-#     for msg in messages:
-#         if not isinstance(msg, ToolMessage):
-#             continue
-#         check_fn = _SEMANTIC_TOOL_CHECKS.get(msg.name)
-#         if check_fn is None:
-#             continue
-#         reason = check_fn(_parse_tool_result(msg.content))
-#         if reason:
-#             return reason
+    #     if not tool_msgs:
+    #         return f"'{tool_name}' was never executed"
 
-#     # --- Layer 3: parse the agent's structured verification block ---
-#     # Scan all AI messages — a FAILED anywhere takes priority over SUCCESS.
-#     found_success = False
-#     for msg in messages:
-#         if not isinstance(msg, AIMessage):
-#             continue
-#         content = msg.content or ""
-#         if not content.strip():
-#             continue
-#         if _VERIFICATION_FAILED_RE.search(content):
-#             return "agent verification block reported Result: FAILED"
-#         if _VERIFICATION_SUCCESS_RE.search(content):
-#             found_success = True
+    #     data = _parse_tool_result(tool_msgs[-1].content)
+    #     if not data.get("success"):
+    #         reason = data.get("message") or data.get("status") or "unknown error"
+    #         return f"'{tool_name}' failed: {reason}"
 
-#     if found_success:
-#         return None
+    # --- Layer 2: did any tool return a domain failure? ---
+    for msg in messages:
+        if not isinstance(msg, ToolMessage) or msg.name not in _CHECKED_TOOLS:
+            continue
+        reason = _check_tool_result(msg.name, _parse_tool_result(msg.content))
+        if reason:
+            return reason
 
-#     return None  # No verification block (chat mode etc.) — treat as success
+    # --- Layer 3: parse the agent's structured verification block ---
+    found_success = False
+    for msg in messages:
+        if not isinstance(msg, AIMessage):
+            continue
+        content = msg.content or ""
+        if not content.strip():
+            continue
+        if _VERIFICATION_FAILED_RE.search(content):
+            return "agent verification block reported Result: FAILED"
+        if _VERIFICATION_SUCCESS_RE.search(content):
+            found_success = True
 
+    if found_success:
+        return None
+
+    return None  # no verification block present — treat as success
 
 # ---------------------------------------------------------------------------
 # Agent node
@@ -182,7 +172,7 @@ class Agent(Node):
                          daemon=True).start()
 
 
-    def handle_query(self, user_query: str, max_attempts: int = 1):
+    def handle_query(self, user_query: str, max_attempts: int = 3):
         episode = self.recorder.start_episode(query=user_query)
         invoke_message = format_message(user_query)
         result = None
@@ -199,27 +189,28 @@ class Agent(Node):
                     context={"user_role": "beginner"},
                 )
 
-                # failure = _extract_failure(result, user_query)
+                failure = _extract_failure(result, user_query)
 
-                # if failure is None:
-                #     self.get_logger().info("Task completed successfully.")
-                #     break
+                if failure is None:
+                    self.get_logger().info("Navigation task completed successfully.")
+                    break
 
-                # if attempt < max_attempts:
-                #     self.get_logger().warning(
-                #         f"Attempt {attempt} failed: {failure}. Retrying..."
-                #     )
-                #     invoke_message = format_message(
-                #         f"[RETRY — Attempt {attempt + 1}/{max_attempts}]\n"
-                #         f"The previous attempt did not complete the task.\n"
-                #         f"Reason: {failure}\n\n"
-                #         f"Return to home pose, then re-execute the original task:\n"
-                #         f"{user_query}"
-                #     )
-                # else:
-                #     self.get_logger().error(
-                #         f"All {max_attempts} attempts failed. Last failure: {failure}"
-                #     )
+                if attempt < max_attempts:
+                    self.get_logger().warning(
+                        f"Attempt {attempt} failed: {failure}. Retrying..."
+                    )
+                    invoke_message = format_message(
+                        f"[RETRY — Attempt {attempt + 1}/{max_attempts}]\n"
+                        f"The previous navigation attempt did not complete.\n"
+                        f"Reason: {failure}\n\n"
+                        f"Call get_current_pose() to re-establish position, "
+                        f"then re-execute the original task:\n"
+                        f"{user_query}"
+                    )
+                else:
+                    self.get_logger().error(
+                        f"All {max_attempts} attempts failed. Last failure: {failure}"
+                    )
 
             formatted = format_response(result)
             print_response(formatted)
@@ -227,7 +218,7 @@ class Agent(Node):
             self.recorder.close_episode_from_formatted_response(
                 episode=episode,
                 formatted=formatted,
-                outcome="success",
+                outcome="success" if _extract_failure(result, user_query) is None else "failed",
             )
             self.get_logger().info(f"Episode saved → {episode.episode_id}")
 
@@ -243,7 +234,6 @@ class Agent(Node):
         finally:
             self.message_recieved = False
             self.get_logger().info("Waiting for the next message...\n")
-
 
     def save_memory(self):
         """
