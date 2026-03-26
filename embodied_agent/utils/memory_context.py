@@ -59,7 +59,7 @@ Produce a context block with these sections (omit any section with no data):
 (arm pose, gripper state, known objects, stack configuration)
 
 ## User Preferences & Facts
-(anything the user has told the agent about themselves)
+(anything the user has told the agent about themselves or anything task that has been mentioned as critical or would be repeated in the future )
 
 ## Previous Tasks
 (what tasks were performed, outcomes, any retries needed — last 3-5 most relevant)
