@@ -140,7 +140,7 @@ def _llm_format(summary: dict, llm, fallback: bool) -> str:
         if word_count >= MAX_CONTEXT_WORDS * 0.95:
             print(f"[memory_context] WARNING: output near limit ({word_count}/{MAX_CONTEXT_WORDS} words) — consider raising MAX_CONTEXT_WORDS or running --compress")
         else:
-            print(f"[memory_context] Qwen distilled memory → {word_count} words")
+            print(f"[memory_context] Qwen distilled memory: {word_count} words")
             print(context)
         return f"\n\n{context}\n"
 

@@ -12,7 +12,7 @@ from .agent import build_embodied_agent
 from .tools import get_tools
 from .utils.utils import format_message, format_response, print_response
 from .utils.episode_recorder import EpisodeRecorder
-from .utils.memory_summarizer import build_summary
+from .utils.episode_summarizer import build_summary
 from .config import get_config
 from .context import Context
 

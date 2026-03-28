@@ -27,6 +27,7 @@ Usage
 """
 
 import argparse
+import ast
 import json
 import re
 from datetime import datetime
@@ -91,7 +92,7 @@ def _classify_task(query: str) -> str:
 
 
 def _is_trivial(query: str) -> bool:
-    return any(p.match(query) for p in _TRIVIAL_QUERY_PATTERNS)
+    return any(p.fullmatch(query) for p in _TRIVIAL_QUERY_PATTERNS)
 
 
 def _slim_output(tool_name: str, raw_output: str) -> str:
@@ -106,8 +107,7 @@ def _slim_output(tool_name: str, raw_output: str) -> str:
     except (json.JSONDecodeError, TypeError):
         try:
             cleaned = re.sub(r"array\([^)]*\)", '"<array>"', raw_output, flags=re.DOTALL)
-            obj = eval(cleaned, {"__builtins__": {}},
-                       {"False": False, "True": True, "None": None})
+            obj = ast.literal_eval(cleaned)
         except Exception:
             return raw_output[:200]
 
@@ -158,20 +158,25 @@ def _extract_outcome_fact(ep: dict) -> str:
     outcome  = ep.get("outcome", "unknown")
     response = ep.get("final_response", "")
     task     = _classify_task(query)
-    key_args = _extract_key_args(ep)
 
     # Try to extract a "Result: X" line from the response
     result_match = re.search(r"Result:\s*([^\n]+)", response, re.IGNORECASE)
     result_str   = result_match.group(1).strip() if result_match else outcome.upper()
 
     if task == "pick_and_place":
-        obj      = key_args.get("picked_object", "object")
-        target   = key_args.get("placed_on", "target")
-        retries  = key_args.get("retries", 0)
-        retry_s  = f" ({retries} retr{'ies' if retries != 1 else 'y'})" if retries else ""
+        key_args = _extract_key_args(ep)
+        placements = key_args.get("placements", [])
+        retries    = key_args.get("retries", 0)
+        retry_s    = f" ({retries} retr{'ies' if retries != 1 else 'y'})" if retries else ""
+        if len(placements) > 1:
+            pairs = ", ".join(f"{p['picked']} → {p['placed_on']}" for p in placements)
+            return f"Multi-place{retry_s}: {pairs}. {result_str}."
+        obj    = key_args.get("picked_object", "object")
+        target = key_args.get("placed_on", "target")
         return f"{obj} picked and placed on {target}{retry_s}. {result_str}."
 
     if task == "pick_only":
+        key_args = _extract_key_args(ep)
         obj    = key_args.get("picked_object", "object")
         retries = key_args.get("retries", 0)
         retry_s = f" ({retries} retr{'ies' if retries != 1 else 'y'})" if retries else ""
@@ -188,35 +193,107 @@ def _extract_outcome_fact(ep: dict) -> str:
     return f"{query.strip().capitalize()}. {result_str}."
 
 
+def _extract_seen_objects(ep: dict) -> list[str]:
+    """
+    Extract object labels seen during an episode from segment_objects outputs.
+    These are the ground-truth labels used by the agent, so they're more
+    reliable for known_objects than free-text from describe_environment.
+    """
+    labels: list[str] = []
+    for tc in ep.get("tool_calls", []):
+        if tc.get("tool") != "segment_objects":
+            continue
+        raw = tc.get("output", "")
+        try:
+            obj = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            try:
+                cleaned = re.sub(r"array\([^)]*\)", '"<array>"', raw, flags=re.DOTALL)
+                obj = ast.literal_eval(cleaned)
+            except Exception:
+                continue
+        for item in obj.get("objects", []):
+            label = item.get("label")
+            if label and label not in labels:
+                labels.append(label)
+    return labels
+
+
 def _extract_key_args(ep: dict) -> dict:
-    """Richer key-args extraction: objects, placement targets, retry count."""
+    """
+    Extract pick/place pairs and retry count from tool call sequence.
+
+    Uses a state machine to correctly pair each pick_up_object with the
+    segment query that preceded it (= what was picked) and the
+    get_place_pose target that follows it (= where it was placed).
+
+    This handles multi-placement episodes correctly, where the naive approach
+    of taking first-segment / last-target would cross the pairs.
+
+    Returns:
+        placements  - list of {picked, placed_on} dicts, one per placement
+        picked_object / placed_on - first placement, kept for backward compat
+        retries     - number of extra pick_up_object calls beyond the first
+    """
     key_args: dict = {}
     tool_calls = ep.get("tool_calls", [])
 
-    segmented: list[str] = []
-    retries = 0
+    placements: list[dict] = []
+    candidate_pick: str | None = None   # last segment label before a pick
+    current_held:   str | None = None   # object currently in gripper
+    current_target: str | None = None   # placement target from get_place_pose
+    in_pick_phase = True                # True = scanning for next pick object
+    pick_attempts = 0
+
     for tc in tool_calls:
+        tool = tc.get("tool", "")
         args = tc.get("args", {})
-        tool = tc["tool"]
 
-        # Segment queries reveal object names (filter out visual QA strings)
-        if "query" in args:
-            q = args["query"]
-            if not re.search(r'\?', q):   # skip "Is the X in the gripper?" checks
-                if q not in segmented:
-                    segmented.append(q)
+        # Parse success from output (default True so unknown = assume ok)
+        try:
+            out = json.loads(tc.get("output", "{}"))
+            success = out.get("success", True)
+        except Exception:
+            success = True
 
-        if "target_object_label" in args:
-            key_args["placed_on"] = args["target_object_label"]
+        if tool == "segment_objects":
+            q = args.get("query", "")
+            # Non-question segment queries in the pick phase identify the target object
+            if in_pick_phase and q and not re.search(r'\?', q):
+                candidate_pick = q
 
-        # Count pick_up_object calls beyond the first as retries
-        if tool == "pick_up_object":
-            retries += 1
+        elif tool == "pick_up_object":
+            pick_attempts += 1
+            if success:
+                current_held = candidate_pick
+                current_target = None
+                in_pick_phase = False   # now scanning for place target
 
-    if segmented:
-        key_args["picked_object"] = segmented[0]
-    if retries > 1:
-        key_args["retries"] = retries - 1   # first attempt isn't a retry
+        elif tool == "get_place_pose":
+            current_target = args.get("target_object_label")
+
+        elif tool == "place_object":
+            if success and current_held:
+                placements.append({
+                    "picked":    current_held,
+                    "placed_on": current_target,
+                })
+            # Reset for next pick-place cycle regardless of success
+            current_held = None
+            current_target = None
+            candidate_pick = None
+            in_pick_phase = True
+
+    if placements:
+        key_args["placements"]    = placements
+        # Backward-compat single fields (first placement)
+        key_args["picked_object"] = placements[0]["picked"]
+        key_args["placed_on"]     = placements[0]["placed_on"]
+
+    # Retries = extra pick_up_object calls beyond the expected one-per-placement
+    total_picks = len(placements) if placements else 1
+    if pick_attempts > total_picks:
+        key_args["retries"] = pick_attempts - total_picks
 
     return key_args
 
@@ -231,8 +308,9 @@ def summarise_episode(ep: dict) -> dict:
         if tc["tool"] not in seen:
             seen.append(tc["tool"])
 
-    key_args = _extract_key_args(ep)
-    task     = _classify_task(ep.get("query", ""))
+    key_args    = _extract_key_args(ep)
+    task        = _classify_task(ep.get("query", ""))
+    seen_objects = _extract_seen_objects(ep)
 
     entry: dict = {
         "time":         ep.get("timestamp_start", "")[:19],
@@ -243,6 +321,8 @@ def summarise_episode(ep: dict) -> dict:
         "outcome_fact": _extract_outcome_fact(ep),
         "tools":        seen,
     }
+    if seen_objects:
+        entry["seen_objects"] = seen_objects
     if key_args:
         entry["key_args"] = key_args
     if ep.get("error"):
@@ -251,8 +331,12 @@ def summarise_episode(ep: dict) -> dict:
 
 
 def summarise_session(path: Path) -> tuple[dict, list[dict]]:
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"Warning: skipping {path} — {e}")
+        return {}, []
 
     meta = {
         "session_id":    data.get("session_id", path.stem),
@@ -278,6 +362,10 @@ def derive_world_state(episodes: list[dict]) -> dict:
     The final stacks list contains one entry per independent tower, each
     formatted bottom→top, e.g.:
       [["red cube", "green cube"], ["yellow cube", "blue cube"]]
+
+    known_objects is populated from:
+      1. segment_objects outputs (structured, ground-truth labels)
+      2. pick/place key_args (placement targets also reveal object names)
     """
     state: dict = {
         "last_updated":  "",
@@ -298,24 +386,37 @@ def derive_world_state(episodes: list[dict]) -> dict:
     for ep in episodes:
         t     = ep.get("task_type")
         kargs = ep.get("key_args", {})
-        obj   = kargs.get("picked_object", "")
-        onto  = kargs.get("placed_on", "")
 
-        if obj:
-            seen_objects.add(obj)
-        if onto:
-            seen_objects.add(onto)
+        # Accumulate known objects from segment_objects outputs
+        for label in ep.get("seen_objects", []):
+            seen_objects.add(label)
+
+        # Also capture placement targets (may not have been segmented directly)
+        for p in kargs.get("placements", []):
+            if p.get("picked"):
+                seen_objects.add(p["picked"])
+            if p.get("placed_on"):
+                seen_objects.add(p["placed_on"])
 
         if ep["outcome"] != "success":
             continue
 
-        if t in ("pick_and_place", "pick_only") and obj:
-            # Object was lifted — it is no longer sitting on anything
-            sitting_on.pop(obj, None)
+        # Apply each pick→place pair to the sitting_on graph in order
+        placements = kargs.get("placements", [])
+        if not placements and t in ("pick_and_place", "pick_only"):
+            # Fallback for episodes without placements list (e.g. legacy data)
+            obj  = kargs.get("picked_object", "")
+            onto = kargs.get("placed_on", "")
+            if obj:
+                placements = [{"picked": obj, "placed_on": onto or None}]
 
-        if t == "pick_and_place" and obj and onto:
-            # Object was placed onto a base
-            sitting_on[obj] = onto
+        for p in placements:
+            obj  = p.get("picked", "")
+            onto = p.get("placed_on")
+            if obj:
+                sitting_on.pop(obj, None)   # object was lifted off its previous base
+            if obj and onto:
+                sitting_on[obj] = onto      # object now rests on onto
 
     # ── Build independent stacks from the sitting_on graph ────────────────────
     # For each object that has nothing sitting on top of it (a "top" object),
@@ -439,8 +540,8 @@ def build_summary(session_files: list[Path], top_k: int | None = None) -> dict:
     # ── Stats (over all episodes, including trivial) ──────────────────────────
     success  = sum(1 for e in all_episodes if e["outcome"] == "success")
     errors   = sum(1 for e in all_episodes if e["outcome"] == "error")
-    avg_dur  = (sum(e["duration_s"] or 0 for e in all_episodes) / len(all_episodes)
-                if all_episodes else 0)
+    valid_durations = [e["duration_s"] for e in all_episodes if e["duration_s"] is not None]
+    avg_dur = sum(valid_durations) / len(valid_durations) if valid_durations else 0
 
     tool_freq: dict[str, int] = {}
     for ep in all_episodes:
