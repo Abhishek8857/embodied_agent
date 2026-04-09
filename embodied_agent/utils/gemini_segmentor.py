@@ -290,10 +290,6 @@ class GeminiSegmentor:
         Y = (v - cy) * z / fy
         Z = z
 
-        # CRITICAL FIX: Negate X and Y to match your camera's frame convention
-        # Your depth camera uses a non-standard optical frame where both axes are flipped
-        # Standard optical: X=right, Y=down, Z=forward
-        # Your camera: X=left, Y=up, Z=forward (effectively)
         return {"x": float(X), "y": float(Y), "z": float(Z)}
 
     @staticmethod

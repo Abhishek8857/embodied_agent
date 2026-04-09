@@ -12,6 +12,7 @@ from .agent import build_embodied_agent
 from .tools import get_tools
 from .utils.utils import format_message, format_response, print_response
 from .utils.episode_recorder import EpisodeRecorder
+from .utils.recovery_advisor import RecoveryAdvisor
 from .utils.episode_summarizer import build_summary
 from .config import get_config
 from .context import Context
@@ -22,131 +23,23 @@ EPISODES_DIR = Path("episodes")
 MEMORY_DIR   = Path("memory")
 
 
-# ---------------------------------------------------------------------------
-# Failure detection — three complementary layers
-# ---------------------------------------------------------------------------
-
-# Layer 1: Terminal tools — must have been called AND succeeded for the task
-# to be considered complete. Maps query keywords → completion tool name.
-_REQUIRED_TOOLS = {
-    "pick":  "pick_up_object",
-    "place": "place_object",
-    "move":  "move_to_pose",
-    "open":  "open_the_gripper",
-    "close": "close_the_gripper",
-}
-
-# Layer 2: Semantic intermediate tool checks — tools that can return
-# success=true but still represent a domain failure blocking downstream steps.
-def _check_segment_objects(data: dict) -> str | None:
-    if data.get("count", 1) == 0 or data.get("objects") == []:
-        msg = data.get("message", "no objects found")
-        return f"segmentation returned no objects: {msg}"
-    return None
-
-def _check_get_latest_grasp_pose(data: dict) -> str | None:
-    if not data.get("success"):
-        return f"no valid grasp pose: {data.get('error', 'unknown')}"
-    return None
-
-_SEMANTIC_TOOL_CHECKS = {
-    "segment_objects":       _check_segment_objects,
-    "get_latest_grasp_pose": _check_get_latest_grasp_pose,
-}
-
-# Layer 3: Agent verification block — system prompt mandates "Result: SUCCESS"
-# or "Result: FAILED", so this is template parsing, not free-text scanning.
-_VERIFICATION_FAILED_RE  = re.compile(r"result\s*:\s*failed",  re.IGNORECASE)
-_VERIFICATION_SUCCESS_RE = re.compile(r"result\s*:\s*success", re.IGNORECASE)
-
-
-def _parse_tool_result(content) -> dict:
-    try:
-        return json.loads(content) if isinstance(content, str) else (content or {})
-    except (json.JSONDecodeError, TypeError):
-        return {}
-
-
 def _extract_failure(result: dict, query: str) -> str | None:
-    """
-    Return a failure description string if the task did not complete,
-    or None if everything succeeded.
+    structured = result.get("structured_response")
 
-    Layer 1 — Terminal tool check (structural):
-        Did the tools representing task completion run and succeed?
-        Catches: required tool never called because an earlier step aborted.
+    # DEBUG:
+    print(f"Structured outcome is {structured.outcome}")
+    
+    if structured is None:
+        return None  # no structured output — treat as success
 
-    Layer 2 — Semantic intermediate tool check:
-        Did any intermediate tool return bad domain data despite success=true?
-        Catches: segment_objects returning count=0, no grasp pose available.
+    if structured.task_type == "query":
+        print(f"Task type {query} detected")
+        return None  # informational, never a failure
 
-    Layer 3 — Agent verification block (template parsing):
-        The system prompt forces "Result: SUCCESS / FAILED" in every action
-        response. Scanning for this is reliable — it is not free-text.
-        Catches: all physical outcome failures the agent itself detects,
-                 e.g. place executed but visual check shows cube missed target.
-    """
-    messages = result.get("messages", [])
-    query_lower = query.lower()
+    if structured.outcome == "failed":
+        return structured.failure_reason or "agent reported failure"
 
-    # --- Layer 1: did terminal tools run and succeed? ---
-    for keyword, tool_name in _REQUIRED_TOOLS.items():
-        if keyword not in query_lower:
-            continue
-
-        tool_msgs = [
-            m for m in messages
-            if isinstance(m, ToolMessage) and m.name == tool_name
-        ]
-
-        if not tool_msgs:
-            return f"'{tool_name}' was never executed"
-
-        data = _parse_tool_result(tool_msgs[-1].content)
-        succeeded = (
-            data.get("success") is True
-            or data.get("final_status") == "SUCCEEDED"
-            or data.get("error_code") == "SUCCESS"
-        )
-        if not succeeded:
-            reason = (
-                data.get("error")
-                or data.get("error_description")
-                or data.get("message")
-                or "unknown error"
-            )
-            return f"'{tool_name}' failed: {reason}"
-
-    # --- Layer 2: did intermediate tools return bad domain data? ---
-    for msg in messages:
-        if not isinstance(msg, ToolMessage):
-            continue
-        check_fn = _SEMANTIC_TOOL_CHECKS.get(msg.name)
-        if check_fn is None:
-            continue
-        reason = check_fn(_parse_tool_result(msg.content))
-        if reason:
-            return reason
-
-    # --- Layer 3: parse the agent's structured verification block ---
-    # Scan all AI messages — a FAILED anywhere takes priority over SUCCESS.
-    found_success = False
-    for msg in messages:
-        if not isinstance(msg, AIMessage):
-            continue
-        content = msg.content or ""
-        if not content.strip():
-            continue
-        if _VERIFICATION_FAILED_RE.search(content):
-            return "agent verification block reported Result: FAILED"
-        if _VERIFICATION_SUCCESS_RE.search(content):
-            found_success = True
-
-    if found_success:
-        return None
-
-    return None  # No verification block (chat mode etc.) — treat as success
-
+    return None
 
 # ---------------------------------------------------------------------------
 # Agent node
@@ -158,11 +51,12 @@ class Agent(Node):
         qos_profile: QoSProfile = QoSProfile(depth=1, durability=QoSDurabilityPolicy.VOLATILE)
         self.subscription = self.create_subscription(String, "query", self.query_callback, qos_profile=qos_profile)
         tools = get_tools(self)
-
+            
         self.agent = build_embodied_agent(tools=tools)
 
         self.recorder = EpisodeRecorder(save_dir=EPISODES_DIR)
         self.get_logger().info(f"Episode recorder session: {self.recorder.session_id}")
+        self.recovery_advisor = RecoveryAdvisor(recorder=self.recorder, memory_path=MEMORY_DIR / "memory.json",)
 
         self.get_logger().info("Agent node initialised!")
         self.message_recieved: bool = False
@@ -206,13 +100,24 @@ class Agent(Node):
                     break
 
                 if attempt < max_attempts:
+                    hint = self.recovery_advisor.get_hint(
+                        failure_reason=failure,
+                        query=user_query,
+                    )
+                    # Record the retry inside the episode before re-invoking
+                    episode.record_retry(
+                        attempt=attempt,
+                        failure_reason=failure,
+                        hint_used=hint,
+                    )
                     self.get_logger().warning(
-                        f"Attempt {attempt} failed: {failure}. Retrying..."
+                        f"Attempt {attempt} failed: {failure}. Retrying with hint: {bool(hint)}"
                     )
                     invoke_message = format_message(
                         f"[RETRY — Attempt {attempt + 1}/{max_attempts}]\n"
                         f"The previous attempt did not complete the task.\n"
                         f"Reason: {failure}\n\n"
+                        f"{hint}\n\n" if hint else ""
                         f"Return to home pose, then re-execute the original task:\n"
                         f"{user_query}"
                     )
@@ -244,12 +149,7 @@ class Agent(Node):
             self.message_recieved = False
             self.get_logger().info("Waiting for the next message...\n")
 
-
     def save_memory(self):
-        """
-        Build and write a compact memory.json from all session files
-        in the episodes directory. Called once on shutdown.
-        """
         session_files = [
             p for p in EPISODES_DIR.glob("*.json")
             if not p.name.startswith("memory")
@@ -261,6 +161,12 @@ class Agent(Node):
 
         try:
             summary = build_summary(session_files)
+
+            # build_summary returns {} when all session files are empty
+            if not summary:
+                self.get_logger().info("No episodes recorded this session, skipping memory save.")
+                return
+
             MEMORY_DIR.mkdir(parents=True, exist_ok=True)
             out_path = MEMORY_DIR / "memory.json"
             with open(out_path, "w", encoding="utf-8") as f:

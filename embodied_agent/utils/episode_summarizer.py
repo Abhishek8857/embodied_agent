@@ -302,15 +302,34 @@ def _extract_key_args(ep: dict) -> dict:
 
 def summarise_episode(ep: dict) -> dict:
     """Convert one full episode dict into a compact summary dict."""
-    # Deduplicate tool list while preserving order
     seen: list[str] = []
     for tc in ep.get("tool_calls", []):
         if tc["tool"] not in seen:
             seen.append(tc["tool"])
 
-    key_args    = _extract_key_args(ep)
-    task        = _classify_task(ep.get("query", ""))
+    key_args     = _extract_key_args(ep)
+    task         = _classify_task(ep.get("query", ""))
     seen_objects = _extract_seen_objects(ep)
+
+    # ── ADD THIS BLOCK ──────────────────────────────────────────────────────
+    # Pull structured retry data written by episode_recorder.record_retry().
+    # _extract_key_args() already counts retries from tool calls (pick attempts),
+    # but that only works for pick/place tasks. This covers ALL task types and
+    # also captures the failure reason and hint that was used.
+    recorder_retries = ep.get("retries", {})
+    retry_count = recorder_retries.get("count", 0)
+
+    # Only override if _extract_key_args didn't already find a higher number
+    # (the tool-call counter is more precise for pick/place; use whichever is larger)
+    if retry_count > key_args.get("retries", 0):
+        key_args["retries"] = retry_count
+
+    # Capture the last failure reason for outcome_fact on failed/retried episodes
+    retry_attempts = recorder_retries.get("attempts", [])
+    last_failure_reason = (
+        retry_attempts[-1].get("failure_reason", "") if retry_attempts else ""
+    )
+    # ── END OF ADDED BLOCK ──────────────────────────────────────────────────
 
     entry: dict = {
         "time":         ep.get("timestamp_start", "")[:19],
@@ -327,6 +346,14 @@ def summarise_episode(ep: dict) -> dict:
         entry["key_args"] = key_args
     if ep.get("error"):
         entry["error"] = ep["error"]
+
+    # ── ADD THIS LINE ───────────────────────────────────────────────────────
+    # Store the failure reason so _compute_failure_stats() in memory_context.py
+    # can read it as outcome_fact on failed/retried episodes
+    if last_failure_reason and entry["outcome"] != "success":
+        entry["outcome_fact"] = last_failure_reason
+    # ── END ─────────────────────────────────────────────────────────────────
+
     return entry
 
 

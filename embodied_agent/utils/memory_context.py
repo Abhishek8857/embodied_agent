@@ -8,7 +8,7 @@ a compact, agent-ready context string covering:
   - User preferences     (favorite color, name, anything stated)
   - Previous tasks       (what was done, outcomes, retry patterns)
   - Learned behaviours   (which tool sequences work, average durations)
-  - Any other useful facts the LLM deems relevant
+  - Failure risk signals (tasks/conditions with elevated failure probability)
 
 The output is a short prose block (~200-400 tokens) injected directly into
 the agent's system prompt.  Because Qwen decides what's relevant, the block
@@ -23,6 +23,7 @@ Usage
 """
 
 import json
+from collections import defaultdict
 from pathlib import Path
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -31,7 +32,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 # Maximum words Qwen is allowed to produce — controls injected prompt size.
 # Raise this if you find the context too sparse; lower it to save tokens.
-MAX_CONTEXT_WORDS = 300
+MAX_CONTEXT_WORDS = 350  # slightly raised to accommodate the new risk section
 
 _SYSTEM_PROMPT = f"""You are a memory distillation assistant for an embodied robot agent.
 Your job is to read a structured memory file and produce a compact, useful context block
@@ -41,11 +42,18 @@ Rules:
 - HARD LIMIT: {MAX_CONTEXT_WORDS} words maximum. Be ruthlessly concise. Cut anything not directly useful for the next task.
 - Use clear sections with short headers.
 - Only include facts that are actually present in the memory — never invent or assume.
-- Prioritise: current physical state > user preferences > recent task outcomes > learned patterns.
+- Prioritise: current physical state > failure risks > user preferences > recent task outcomes > learned patterns.
 - Skip sections that have no data (e.g. omit "Robot State" if arm_pose is unknown).
 - If an archived_summary exists, treat it as a condensed history — do not expand it.
 - Write in a factual, direct tone suitable for an agent system prompt.
-- Do NOT include meta-commentary like "the memory shows..." — just state the facts directly."""
+- Do NOT include meta-commentary like "the memory shows..." — just state the facts directly.
+
+For the Failure Risk section specifically:
+- A task type is HIGH RISK if its failure_rate exceeds 0.4 OR it has required 2+ retries in any single episode.
+- A task type is MEDIUM RISK if its failure_rate is between 0.2–0.4 OR it has a known fragile precondition.
+- Only list LOW RISK tasks if they share a tool with a HIGH/MEDIUM risk task (to flag contamination).
+- For each risk entry state: the task type, the observed failure rate or retry count, and the most
+  likely root cause or missing precondition if it can be inferred from the episode outcomes."""
 
 _USER_PROMPT_TEMPLATE = """Here is the robot agent's memory file. Extract and summarise the most
 relevant context for the agent's next session.
@@ -58,8 +66,18 @@ Produce a context block with these sections (omit any section with no data):
 ## Current Robot State
 (arm pose, gripper state, known objects, stack configuration)
 
+## Failure Risk Signals
+CRITICAL — read this before planning any task.
+List task types ordered from highest to lowest failure risk. For each entry include:
+- Risk level: HIGH / MEDIUM / LOW
+- Task type name
+- Failure rate or retry pattern (e.g. "failed 1/2 attempts", "always needs 1 retry")
+- Most likely cause or fragile precondition (e.g. "gripper not reset between picks",
+  "object_detection times out when >3 objects present")
+If no failures or retries exist in memory, write: "No failure patterns recorded yet."
+
 ## User Preferences & Facts
-(anything the user has told the agent about themselves or anything task that has been mentioned as critical or would be repeated in the future )
+(anything the user has told the agent about themselves or anything task that has been mentioned as critical or would be repeated in the future)
 
 ## Previous Tasks
 (what tasks were performed, outcomes, any retries needed — last 3-5 most relevant)
@@ -123,6 +141,8 @@ def _llm_format(summary: dict, llm, fallback: bool) -> str:
     payload = {
         **{k: v for k, v in summary.items() if k != "recent_episodes"},
         "recent_episodes": summary.get("recent_episodes", [])[-EPISODE_WINDOW:],
+        # Inject pre-computed failure stats so Qwen doesn't have to count
+        "_failure_stats": _compute_failure_stats(summary.get("recent_episodes", [])),
     }
     memory_json_str = json.dumps(payload, indent=2, ensure_ascii=False)
 
@@ -150,6 +170,83 @@ def _llm_format(summary: dict, llm, fallback: bool) -> str:
             print("[memory_context] Falling back to manual formatting.")
             return _manual_format(summary)
         raise
+
+
+# ── Failure statistics helper ─────────────────────────────────────────────────
+
+# Thresholds for risk classification used by both the LLM payload and manual formatter.
+RISK_HIGH_FAILURE_RATE   = 0.40   # ≥40% failure rate → HIGH
+RISK_MEDIUM_FAILURE_RATE = 0.20   # 20–39% → MEDIUM; <20% → LOW (only shown if tool overlap)
+RISK_HIGH_RETRY_THRESHOLD   = 2   # any episode with ≥2 retries → HIGH regardless of rate
+RISK_MEDIUM_RETRY_THRESHOLD = 1   # any episode with 1 retry → at least MEDIUM
+
+
+def _compute_failure_stats(episodes: list[dict]) -> dict:
+    """
+    Aggregate per-task-type failure statistics from the episode list.
+
+    Returns a dict keyed by task_type with the shape:
+    {
+        "pick_and_place": {
+            "attempts":      5,
+            "failures":      2,
+            "failure_rate":  0.4,
+            "max_retries":   2,          # worst single episode
+            "total_retries": 3,
+            "risk_level":    "HIGH",
+            "failure_causes": ["gripper open at pick", "object not found"],
+        },
+        ...
+    }
+    Cause strings are taken from episode["outcome_fact"] on failed/retried episodes.
+    """
+    stats: dict[str, dict] = defaultdict(lambda: {
+        "attempts": 0,
+        "failures": 0,
+        "max_retries": 0,
+        "total_retries": 0,
+        "failure_causes": [],
+    })
+
+    for ep in episodes:
+        task = ep.get("task_type", "other")
+        if task == "other":
+            continue
+
+        s = stats[task]
+        s["attempts"] += 1
+
+        retries = ep.get("key_args", {}).get("retries", 0)
+        s["total_retries"] += retries
+        s["max_retries"] = max(s["max_retries"], retries)
+
+        if ep.get("outcome") != "success":
+            s["failures"] += 1
+            cause = ep.get("outcome_fact", "").strip()
+            if cause and cause not in s["failure_causes"]:
+                s["failure_causes"].append(cause)
+        elif retries > 0:
+            # Succeeded but only after retries — still a fragility signal.
+            cause = ep.get("outcome_fact", "").strip()
+            if cause and cause not in s["failure_causes"]:
+                s["failure_causes"].append(f"[recovered] {cause}")
+
+    # Compute derived fields and risk level.
+    result = {}
+    for task, s in stats.items():
+        rate = s["failures"] / s["attempts"] if s["attempts"] else 0.0
+        s["failure_rate"] = round(rate, 3)
+
+        if rate >= RISK_HIGH_FAILURE_RATE or s["max_retries"] >= RISK_HIGH_RETRY_THRESHOLD:
+            risk = "HIGH"
+        elif rate >= RISK_MEDIUM_FAILURE_RATE or s["max_retries"] >= RISK_MEDIUM_RETRY_THRESHOLD:
+            risk = "MEDIUM"
+        else:
+            risk = "LOW"
+        s["risk_level"] = risk
+        result[task] = s
+
+    return result
 
 
 def _manual_format(summary: dict) -> str:
@@ -181,6 +278,36 @@ def _manual_format(summary: dict) -> str:
         for i, tower in enumerate(ws.get("stacks", []), 1):
             label = f"Stack {i}" if len(ws.get("stacks", [])) > 1 else "Stack"
             lines.append(f"- {label} (bottom→top): {' > '.join(tower)}")
+
+    # ── Failure risk signals ──────────────────────────────────────────────────
+    all_eps   = summary.get("recent_episodes", [])
+    fail_stats = _compute_failure_stats(all_eps)
+
+    # Sort: HIGH first, then MEDIUM, then LOW — skip LOW unless there's a
+    # tool-sequence overlap with a riskier task (keep the fallback simple:
+    # just omit pure-LOW entries).
+    risk_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    risky = sorted(
+        [(t, s) for t, s in fail_stats.items() if s["risk_level"] != "LOW"],
+        key=lambda x: risk_order[x[1]["risk_level"]],
+    )
+
+    lines.append("\n### Failure Risk Signals")
+    if not risky:
+        lines.append("- No failure patterns recorded yet.")
+    else:
+        for task, s in risky:
+            rate_pct  = f"{s['failure_rate']*100:.0f}%"
+            retry_str = (f", max {s['max_retries']} retr{'ies' if s['max_retries'] != 1 else 'y'}/episode"
+                         if s["max_retries"] > 0 else "")
+            cause_str = ""
+            if s["failure_causes"]:
+                # Show the most recent / most informative cause only.
+                cause_str = f" — {s['failure_causes'][-1]}"
+            lines.append(
+                f"- [{s['risk_level']}] {task}: "
+                f"{s['failures']}/{s['attempts']} failed ({rate_pct}){retry_str}{cause_str}"
+            )
 
     # ── User preferences ──────────────────────────────────────────────────────
     if uf:

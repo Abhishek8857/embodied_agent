@@ -9,7 +9,7 @@ from .context import Context
 from .middleware import dynamic_system_prompt, handle_tool_errors, dynamic_model_selection
 from .utils.utils import get_langsmith_api_key
 from .utils.memory_context import build_memory_context
-
+from .response_format import ResponseFormat
 
 def build_embodied_agent(tools, memory_summary_path: str = "memory/memory.json"):
 
@@ -34,6 +34,7 @@ def build_embodied_agent(tools, memory_summary_path: str = "memory/memory.json")
         middleware=[handle_tool_errors],
         checkpointer=get_memory(),
         store=store,
+        response_format=ResponseFormat
     )
 
     return embodied_agent

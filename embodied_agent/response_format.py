@@ -1,19 +1,20 @@
 from pydantic import BaseModel
-from typing import List, Union
+from typing import List, Union, Literal
 
 
 class ToolResult(BaseModel):
-    """Response format for the Tool Call"""
     name: str
     args: dict
     result: Union[int, float, str]
-    
+
 
 class ResponseFormat(BaseModel):
-    """Response format for the Agent"""
     response: str
     answer: Union[int, float, str] | None = None
     tools: Union[List[ToolResult]] | None = None
-    
+    task_type: Literal["action", "query"] = "query"
+    outcome: Literal["success", "failed"] = "success"
+    failure_reason: str | None = None
+
     class Config:
         extra = "forbid"

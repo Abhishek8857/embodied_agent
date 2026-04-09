@@ -4,6 +4,7 @@ import rclpy
 import tf2_ros
 import threading
 import time
+import json
 
 from typing import Dict, Optional, Any
 from rclpy.duration import Duration
@@ -29,15 +30,6 @@ def format_message (msg: str) -> dict:
 
 
 def format_response(msg: dict) -> dict:
-    """
-    Function to format and print the Agents response to a Readable format in terminal
-
-    Args:
-        msg (dict): The output of the Agent in a dictionary format.
-
-    Returns:
-        dict: Formatted response in a dictionary format with human_messages, ai_messages, final_response as keys.
-    """
     data = msg["messages"]
     human_messages, ai_messages, tool_calls, final_response = [], [], [], []
 
@@ -46,12 +38,20 @@ def format_response(msg: dict) -> dict:
             human_messages.append({"content": obj.content})
 
         elif isinstance(obj, AIMessage):
-            # final text
+            # Final text — parse structured JSON response if present
             if obj.content and obj.content.strip():
-                final_response.append({"content": obj.content})
-            # tool calls (can be multiple)
+                content = obj.content
+                try:
+                    parsed = json.loads(content)
+                    content = parsed.get("response", content)
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+                final_response.append({"content": content})
+            # Tool calls — preserve as a group so we can match with ToolMessages
             if getattr(obj, "tool_calls", None):
-                ai_messages.extend(obj.tool_calls)
+                ai_messages.append({
+                    "tool_calls": obj.tool_calls  # keep grouped per AIMessage
+                })
 
         elif isinstance(obj, ToolMessage):
             tool_calls.append({
@@ -67,66 +67,52 @@ def format_response(msg: dict) -> dict:
         "final_response": final_response
     }
 
-def print_response(data: dict):
-    """    
-    Print only the latest full exchange (Human → AI → Tool(s) → Final AI Response).
-    Handles multiple tool calls made during one request.
-    Clears the screen before printing for a live-display effect.
 
-    Args:
-        data (dict): _description_
-    """
+def print_response(data: dict):
     human_msgs = data.get("human_messages", [])
-    ai_msgs = data.get("ai_messages", [])
-    tool_msgs = data.get("tool_calls", [])
+    ai_msgs = data.get("ai_messages", [])      # list of {"tool_calls": [...]}
+    tool_msgs = data.get("tool_calls", [])      # flat list of ToolMessage dicts
     final_responses = data.get("final_response", [])
 
-    # Clear terminal for live dashboard style output
     os.system("clear")
 
     width = 80
     def print_centered_header(title: str):
         print(f" {title} ".center(width, "="))
 
-    # Get the latest human message
-    h_msg = human_msgs[-1] if human_msgs else None
-
-    # Determine which AI and tool messages belong to this exchange
-    last_human_index = len(human_msgs) - 1
-    ai_after_human = ai_msgs[last_human_index:] if ai_msgs else []
-    final = final_responses[-1] if final_responses else None
-
-    # Create a lookup map for tool call outputs
+    # Create a lookup map: tool_call_id -> tool result
     tool_map = {t['tool_call_id']: t for t in tool_msgs}
 
     # === Print Human Message ===
+    h_msg = human_msgs[-1] if human_msgs else None
     if h_msg:
         print_centered_header("Human Message")
         print(h_msg["content"])
         print()
 
-    # === Print All AI Messages & Tools ===
-    for ai_msg in ai_after_human:
-        print_centered_header("AI Message")
-
-        if "name" in ai_msg and "args" in ai_msg:
+    # === Print All AI Tool Call Groups & Their Outputs ===
+    for ai_turn in ai_msgs:
+        for tc in ai_turn.get("tool_calls", []):
+            print_centered_header("AI Message")
             print("Tool Calls:")
-            print(f"  {ai_msg['name']} (Call ID: {ai_msg['id']})")
-            print("  Args:")
-            for k, v in ai_msg["args"].items():
-                print(f"    {k}: {v}")
+            print(f"  {tc['name']} (Call ID: {tc['id']})")
+            if tc.get("args"):
+                print("  Args:")
+                for k, v in tc["args"].items():
+                    print(f"    {k}: {v}")
 
-            # Find and print corresponding tool message(s)
-            t_msg = tool_map.get(ai_msg['id'])
+            # Print the matching tool output
+            t_msg = tool_map.get(tc['id'])
             if t_msg:
                 print()
                 print_centered_header("Tool Message")
                 print(f"Name: {t_msg['tool']}")
                 print(f"Output: {t_msg['output']}")
                 print(f"Tool Call ID: {t_msg['tool_call_id']}")
-        print()
+            print()
 
     # === Print Final Response ===
+    final = final_responses[-1] if final_responses else None
     if final:
         print_centered_header("Final AI Response")
         print(final["content"])
