@@ -4,7 +4,7 @@ memory_context.py
 Uses Qwen (via OpenRouter) to read the full memory_summary.json and produce
 a compact, agent-ready context string covering:
 
-  - Current robot state  (arm pose, gripper, known objects, stack)
+  - Current robot state  (arm pose, gripper, known objects)
   - User preferences     (favorite color, name, anything stated)
   - Previous tasks       (what was done, outcomes, retry patterns)
   - Learned behaviours   (which tool sequences work, average durations)
@@ -43,6 +43,7 @@ Rules:
 - Use clear sections with short headers.
 - Only include facts that are actually present in the memory — never invent or assume.
 - Prioritise: current physical state > failure risks > user preferences > recent task outcomes > learned patterns.
+- For robot state, always list scene_objects (what is visible) separately from handled_objects (what has been grasped before). Make clear that scene_objects are valid pick targets even if not in handled_objects.
 - Skip sections that have no data (e.g. omit "Robot State" if arm_pose is unknown).
 - If an archived_summary exists, treat it as a condensed history — do not expand it.
 - Write in a factual, direct tone suitable for an agent system prompt.
@@ -64,7 +65,12 @@ MEMORY FILE:
 Produce a context block with these sections (omit any section with no data):
 
 ## Current Robot State
-(arm pose, gripper state, known objects, stack configuration)
+(arm pose, gripper state, scene objects, previously handled objects)
+
+**Important distinction:**
+- `scene_objects` = objects currently visible in the workspace (from describe_environment). DO NOT assume these objects are still present. Always capture and describe a new image to confirm the scene.
+- `handled_objects` = objects the robot has previously segmented or grasped. A subset of scene_objects.
+- An object being absent from `handled_objects` does NOT mean it cannot be picked — if it appears in `scene_objects` or the scene description, it is a valid target.
 
 ## Failure Risk Signals
 CRITICAL — read this before planning any task.
@@ -82,25 +88,25 @@ If no failures or retries exist in memory, write: "No failure patterns recorded 
 ## Previous Tasks
 (what tasks were performed, outcomes, any retries needed — last 3-5 most relevant)
 
-## Learned Behaviours
-(which tool sequences work well, typical durations, anything worth knowing for future tasks)
-
 Write only the context block, nothing else."""
+
+# ## Learned Behaviours
+# (which tool sequences work well, typical durations, anything worth knowing for future tasks)
 
 
 # ── Main function ──────────────────────────────────────────────────────────────
 
 def build_memory_context(
-    summary_path: str | Path = "memory_summary.json",
+    summary_path: str | Path = "memory.json",
     llm=None,
     fallback_to_manual: bool = True,
 ) -> str:
     """
-    Read memory_summary.json and return a compact context string for the agent.
+    Read memory.json and return a compact context string for the agent.
 
     Parameters
     ----------
-    summary_path       : path to memory_summary.json (from memory_summarizer.py)
+    summary_path       : path to memory.json (from memory_summarizer.py)
     llm                : a LangChain chat model — pass get_qwen_llm() here.
                          If None, falls back to manual formatting.
     fallback_to_manual : if True and the LLM call fails, fall back to manual
@@ -129,7 +135,7 @@ def build_memory_context(
 # world_state + user_facts + procedures are always sent in full.
 # Archived summary (if present) replaces older episodes so this window
 # only needs to cover genuinely recent activity.
-EPISODE_WINDOW = 15
+EPISODE_WINDOW = 10
 
 
 def _llm_format(summary: dict, llm, fallback: bool) -> str:
@@ -264,7 +270,8 @@ def _manual_format(summary: dict) -> str:
     # ── Robot state ───────────────────────────────────────────────────────────
     has_state = (ws.get("arm_pose") not in (None, "unknown")
                  or ws.get("gripper") not in (None, "unknown")
-                 or ws.get("known_objects")
+                 or ws.get("handled_objects")
+                 or ws.get("scene_objects")
                  or ws.get("stack"))
 
     if has_state:
@@ -273,8 +280,10 @@ def _manual_format(summary: dict) -> str:
             lines.append(f"- Arm: {ws['arm_pose']}")
         if ws.get("gripper") not in (None, "unknown"):
             lines.append(f"- Gripper: {ws['gripper']}")
-        if ws.get("known_objects"):
-            lines.append(f"- Known objects: {', '.join(ws['known_objects'])}")
+        if ws.get("scene_objects"):
+            lines.append(f"- Objects visible in scene: {', '.join(ws['scene_objects'])}")
+        if ws.get("handled_objects"):
+            lines.append(f"- Previously handled (segmented/grasped): {', '.join(ws['handled_objects'])}")
         for i, tower in enumerate(ws.get("stacks", []), 1):
             label = f"Stack {i}" if len(ws.get("stacks", [])) > 1 else "Stack"
             lines.append(f"- {label} (bottom→top): {' > '.join(tower)}")

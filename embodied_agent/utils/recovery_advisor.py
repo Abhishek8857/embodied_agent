@@ -3,8 +3,7 @@ recovery_advisor.py
 -------------------
 Bridges episodic memory and task recovery.
 Given a failure reason + query, it searches past episodes for similar
-failures and extracts what recovery sequences actually worked — then
-returns a concise hint string to inject into the retry prompt.
+failures and uses an LLM to generate a context-aware recovery hint.
 """
 
 import re
@@ -12,6 +11,7 @@ import json
 from pathlib import Path
 from .episode_recorder import EpisodeRecorder
 from .memory_context import _compute_failure_stats
+
 
 # ── Task type classifier ───────────────────────────────────────────────────────
 _TASK_PATTERNS = {
@@ -34,17 +34,20 @@ def classify_task(query: str) -> str:
 
 class RecoveryAdvisor:
     """
-    Reads episodic memory to produce context-aware retry hints.
+    Uses an LLM to generate context-aware retry hints drawn from:
+      - cross-session memory (memory.json)
+      - current-session episode history
+      - the specific failure reason
 
     Usage
     -----
-        advisor = RecoveryAdvisor(recorder, memory_path="memory/memory.json")
+        advisor = RecoveryAdvisor(recorder, llm=get_qwen_llm(), memory_path="memory/memory.json")
         hint = advisor.get_hint(failure_reason, user_query)
-        # inject `hint` into the retry message
     """
 
-    def __init__(self, recorder: EpisodeRecorder, memory_path: str = "memory/memory.json"):
+    def __init__(self, recorder: EpisodeRecorder, llm, memory_path: str = "memory/memory.json"):
         self.recorder = recorder
+        self.llm = llm
         self.memory_path = Path(memory_path)
 
     # ── Public API ─────────────────────────────────────────────────────────────
@@ -55,108 +58,134 @@ class RecoveryAdvisor:
         no relevant history is found.
         """
         task_type = classify_task(query)
-        lines = []
 
-        # 1. Check cross-session memory for known failure patterns on this task type
-        cross_session_hint = self._cross_session_hint(task_type)
-        if cross_session_hint:
-            lines.append(cross_session_hint)
+        # Gather raw context from memory and current session
+        cross_session_context = self._load_cross_session_context(task_type)
+        session_context        = self._load_session_context(task_type)
 
-        # 2. Check current session for a previously successful recovery on same task
-        session_hint = self._session_recovery_hint(task_type, failure_reason)
-        if session_hint:
-            lines.append(session_hint)
-
-        # 3. If failure mentions a specific tool, check if that tool has a known fix
-        tool_hint = self._tool_specific_hint(failure_reason)
-        if tool_hint:
-            lines.append(tool_hint)
-
-        if not lines:
+        # If there's nothing to reason over, return empty
+        if not cross_session_context and not session_context:
             return ""
 
-        return (
-            "[Memory-informed recovery hints — apply these before retrying]\n"
-            + "\n".join(lines)
+        # Ask the LLM to synthesize a recovery hint
+        return self._generate_hint(
+            query=query,
+            task_type=task_type,
+            failure_reason=failure_reason,
+            cross_session_context=cross_session_context,
+            session_context=session_context,
         )
 
-    # ── Internal helpers ───────────────────────────────────────────────────────
+    # ── Context loaders ────────────────────────────────────────────────────────
 
-    def _cross_session_hint(self, task_type: str) -> str:
-        """Read memory.json and surface failure patterns for this task type."""
+    def _load_cross_session_context(self, task_type: str) -> dict:
+        """
+        Load relevant data from memory.json for this task type.
+        Returns a dict with failure stats, known causes, and proven sequences.
+        """
         if not self.memory_path.exists():
-            return ""
+            return {}
 
         try:
             with open(self.memory_path, encoding="utf-8") as f:
                 memory = json.load(f)
         except Exception:
-            return ""
+            return {}
 
         episodes = memory.get("recent_episodes", [])
         stats = _compute_failure_stats(episodes)
+        task_stats = stats.get(task_type)
 
-        if task_type not in stats:
-            return ""
-
-        s = stats[task_type]
-        if s["risk_level"] == "LOW":
-            return ""
-
-        parts = [
-            f"• [{s['risk_level']} RISK] '{task_type}' has failed "
-            f"{s['failures']}/{s['attempts']} times across sessions."
+        # Pull relevant episodes for this task type (successes after retries,
+        # and failures) so the LLM can reason over what actually happened
+        relevant_episodes = [
+            {
+                "query":          ep.get("query"),
+                "outcome":        ep.get("outcome"),
+                "retries":        ep.get("retries", {}),
+                "tool_sequence":  [tc["tool"] for tc in ep.get("tool_calls", [])],
+                "final_response": ep.get("final_response", "")[:300],  # truncate for context window
+            }
+            for ep in episodes
+            if classify_task(ep.get("query", "")) == task_type
         ]
-        if s["failure_causes"]:
-            parts.append(f"  Known causes: {'; '.join(s['failure_causes'][-2:])}")
 
-        # Surface a successful recovery tool sequence if one exists
-        procs = memory.get("procedures", {}).get(task_type, {})
-        seq = procs.get("tool_sequence")
-        if seq:
-            parts.append(f"  Proven sequence: {' → '.join(seq)}")
+        return {
+            "task_type":          task_type,
+            "stats":              task_stats,
+            "procedures":         memory.get("procedures", {}).get(task_type, {}),
+            "relevant_episodes":  relevant_episodes[-5:],  # last 5 relevant episodes
+        }
 
-        return "\n".join(parts)
-
-    def _session_recovery_hint(self, task_type: str, failure_reason: str) -> str:
+    def _load_session_context(self, task_type: str) -> list[dict]:
         """
-        Scan current-session episodes: if we've seen this task_type fail
-        before and then succeed on a retry, extract what changed.
+        Scan current-session episodes for same task type, focusing on
+        retried episodes and what recovery sequences succeeded.
         """
         all_eps = self.recorder.get_all_episodes()
-        relevant = [
-            e for e in all_eps
-            if e.get("task_type") == task_type
-            and e.get("retries", {}).get("count", 0) > 0
-            and e.get("outcome") == "success"
-        ]
-        if not relevant:
+        return [
+            {
+                "query":         ep.get("query"),
+                "outcome":       ep.get("outcome"),
+                "retries":       ep.get("retries", {}),
+                "tool_sequence": [tc["tool"] for tc in ep.get("tool_calls", [])],
+                "final_response": ep.get("final_response", "")[:300],
+            }
+            for ep in all_eps
+            if classify_task(ep.get("query", "")) == task_type
+        ][-5:]  # last 5 relevant from this session
+
+    # ── LLM hint generation ────────────────────────────────────────────────────
+
+    def _generate_hint(
+        self,
+        query: str,
+        task_type: str,
+        failure_reason: str,
+        cross_session_context: dict,
+        session_context: list,
+    ) -> str:
+        """
+        Prompt the LLM with all gathered context and ask it to generate
+        a concise, actionable recovery hint.
+        """
+        prompt = f"""You are a recovery advisor for a 7-DOF robot arm agent.
+        The agent just failed a task and is about to retry. Your job is to generate a concise, 
+        actionable recovery hint based on the failure and past episode history.
+
+        === CURRENT FAILURE ===
+        Task type    : {task_type}
+        User query   : {query}
+        Failure reason: {failure_reason}
+
+        === CROSS-SESSION MEMORY (past episodes across all sessions) ===
+        {json.dumps(cross_session_context, indent=2, default=str)}
+
+        === CURRENT SESSION HISTORY (episodes so far this session) ===
+        {json.dumps(session_context, indent=2, default=str)}
+
+        === INSTRUCTIONS ===
+        - Analyse what has gone wrong historically for this task type.
+        - Identify what tool sequences or strategies have led to success after failure.
+        - Generate a SHORT, SPECIFIC, ACTIONABLE hint (2 bullet points max).
+        - Focus on what the agent should do on the retry. It is fine if  
+        - Do NOT repeat generic advice. Only mention things grounded in the history above.
+        - Do NOT ask clarifying questions. Do NOT request more information. Always commit to a hint.
+        - NEVER suggest reusing a previous grasp pose, saved coordinates, or cached tool outputs —
+        the object may have moved since the last attempt. Always recommend fresh perception.
+        - If there is genuinely no useful pattern in the history, respond with exactly: NO_HINT
+        Recovery hint:"""
+
+        try:
+            response = self.llm.invoke(prompt)
+            # Handle both string responses and LangChain message objects
+            text = response.content if hasattr(response, "content") else str(response)
+            text = text.strip()
+
+            if not text or text == "NO_HINT":
+                return ""
+
+            return "[Memory-informed recovery hints — apply these before retrying]\n" + text
+
+        except Exception as e:
             return ""
-
-        # Take the most recent successful recovery
-        last = relevant[-1]
-        hint_used = last.get("retries", {}).get("hint_used", "")
-        sequence  = [tc["tool"] for tc in last.get("tool_calls", [])]
-
-        lines = [f"• This session: '{task_type}' previously recovered successfully."]
-        if hint_used:
-            lines.append(f"  Hint that worked: {hint_used}")
-        if sequence:
-            lines.append(f"  Tool sequence that succeeded: {' → '.join(sequence[-6:])}")
-        return "\n".join(lines)
-
-    def _tool_specific_hint(self, failure_reason: str) -> str:
-        """
-        If the failure mentions a known fragile tool, return a targeted fix hint.
-        """
-        _TOOL_HINTS = {
-            "segment_objects":       "Ensure capture_rgbd() was called immediately before segment_objects().",
-            "get_latest_grasp_pose": "If no grasp pose is found, re-run capture_rgbd() → segment_objects() → save_segmentation_for_graspnet() before retrying.",
-            "pick_up_object":        "Reset gripper to open state before attempting pick. Verify grasp pose is fresh (max_age_s ≤ 3.0).",
-            "place_object":          "Confirm object is still in gripper via describe_environment() before executing place.",
-            "move_to_pose":          "Verify target coordinates are within workspace bounds. Check for collision with get_current_pose() first.",
-        }
-        for tool, hint in _TOOL_HINTS.items():
-            if tool in failure_reason:
-                return f"• Tool-specific fix for '{tool}': {hint}"
-        return ""

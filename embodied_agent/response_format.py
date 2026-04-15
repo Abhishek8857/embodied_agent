@@ -1,11 +1,19 @@
-from pydantic import BaseModel
-from typing import List, Union, Literal
+from pydantic import BaseModel, field_validator
+from typing import List, Union, Literal, Any
+import json
 
 
 class ToolResult(BaseModel):
     name: str
     args: dict
-    result: Union[int, float, str]
+    result: Any = None
+
+    @field_validator("result", mode="before")
+    @classmethod
+    def coerce_complex_to_str(cls, v):
+        if isinstance(v, (list, dict)):
+            return json.dumps(v)
+        return v
 
 
 class ResponseFormat(BaseModel):

@@ -35,12 +35,16 @@ class RegisterPoses:
         self._load()
 
     # ── Private ───────────────────────────────────────────────────────────────
-
     def _load(self) -> None:
         if os.path.exists(self.path):
             try:
                 with open(self.path, "r") as f:
-                    self._poses = json.load(f)
+                    raw = json.load(f)
+                # Normalise keys on load so manually edited files always work
+                self._poses = {
+                    k.strip().lower().replace(" ", "_"): v
+                    for k, v in raw.items()
+                }
             except (json.JSONDecodeError, OSError) as e:
                 print(f"[PoseRegistry] Failed to load {self.path}: {e}. Starting empty.")
                 self._poses = {}

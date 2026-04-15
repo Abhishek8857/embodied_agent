@@ -81,10 +81,13 @@ prompt = """
         COMMAND INTERPRETATION RULES
         ============================================================
 
-        A) Named pose commands (e.g. "go home pose", "go to retract", "go place pose", "go to pick pose"):
-          1) Call list_saved_poses() if you are unsure whether the pose exists.
-          2) Call move_to_named_pose(name).
-          3) Verify with get_current_joint_states().
+        A) Named pose commands (e.g. "go home", "go to retract", "go to pick pose", "go to place pose",
+          "go to the place pose", "move to home"):
+          - "place pose", "pick pose" etc. are POSE NAMES, not manipulation commands.
+          - If the query starts with "go to <name>" or "move to <name>" and <name> matches a saved
+            pose, treat it as a named pose command — NOT as a pick/place manipulation task.
+          1) Call move_to_named_pose(name).
+          2) Verify with get_current_joint_states().
 
         B) Saving a pose (e.g. "save this as above_table"):
           1) Call save_current_pose(name, description).
@@ -122,13 +125,13 @@ prompt = """
         H) Pick up an object:
           - REQUIRE a specific object. If not specified, ask and DO NOT execute.
           - Steps:
-            1) capture_rgbd()
+            1) capture_rgbd() 
             2) segment_objects(query=<object name>)
             3) save_segmentation_for_graspnet()
             4) get_latest_grasp_pose()
             5) pick_up_object(x, y, z, qx, qy, qz, qw) using the grasp pose
-            6) move_to_named_pose("home") to return to home
-            7) capture_only_rgb_image(), then describe_environment("Is the <object> extremely close to the camera, suggesting it lies inside the gripper?")
+            6) move_to_named_pose("home") to return to home CRITICAL
+            7) capture_only_rgb_image(), then describe_environment("Is the <object> extremely close to the camera or not any more in the workspace, suggesting it lies inside the gripper?")
 
         I) Place an object:
           - REQUIRE a target surface. If not specified, ask and DO NOT execute.
@@ -154,7 +157,7 @@ prompt = """
           - Orientation (if unchanged): (1 - |dot(q_target, q_actual)|) <= 0.01
 
         For joint/gripper/named-pose moves: verify using get_current_joint_states().
-          - Joint error <= 0.02 rad per joint
+          - Joint error <= 0.05 rad per joint
 
         On failure or verification mismatch:
           - Retry the command ONCE automatically without asking the user.

@@ -1,5 +1,5 @@
 """
-memory_summarizer.py  (v2)
+memory_summarizer.py  (v3)
 --------------------------
 Reads multiple episodic memory session JSON files and produces a two-layer
 memory file optimised for injecting into an agent's context window.
@@ -49,6 +49,7 @@ _SLIM_OUTPUT_KEYS: dict[str, list[str]] = {
     "grasp_object":                       ["success", "final_status"],
     "place_object":                       ["success", "final_status"],
     "move_to_home_pose":                  ["success", "final_status", "elapsed_s"],
+    "move_to_named_pose":                 ["success", "final_status", "elapsed_s"],
     "move_to_pose":                       ["success", "final_status"],
     "get_current_joint_states":           ["success"],
     "capture_rgbd":                       ["success", "path"],
@@ -71,18 +72,93 @@ _TRIVIAL_QUERY_PATTERNS = [
     ]
 ]
 
+# describe_environment calls whose query is about confirming a grasp outcome
+# should NOT be stored as the world-state scene — they are outcome checks.
+_GRASP_VERIFY_PATTERN = re.compile(
+    r"\b(grasped|grasping|assess\s+whether|likely\s+grasped|being\s+held|confirm\s+if"
+    r"|is\s+(it\s+)?grasped|visual\s+assessment)\b",
+    re.IGNORECASE,
+)
+
 # Task-type classifiers  (query → procedure key)
+# Order matters: more specific patterns first.
 _TASK_PATTERNS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"pick.*place|place.*on|stack|put.*on", re.IGNORECASE), "pick_and_place"),
-    (re.compile(r"pick\s+up|grasp|grab",               re.IGNORECASE), "pick_only"),
-    (re.compile(r"go\s+home|home\s+pose|return\s+home", re.IGNORECASE), "home"),
-    (re.compile(r"open\s+gripper",                      re.IGNORECASE), "open_gripper"),
-    (re.compile(r"close\s+gripper",                     re.IGNORECASE), "close_gripper"),
-    (re.compile(r"describe|look|see|observe|what.+see", re.IGNORECASE), "observe"),
+    (re.compile(r"pick.*place|place.*on|stack|put.*on",              re.IGNORECASE), "pick_and_place"),
+    (re.compile(r"pick\s+up|grasp|grab",                             re.IGNORECASE), "pick_only"),
+    (re.compile(r"go\s+home|home\s+pose|return\s+home",              re.IGNORECASE), "home"),
+    (re.compile(r"open\s+gripper",                                   re.IGNORECASE), "open_gripper"),
+    (re.compile(r"close\s+gripper",                                  re.IGNORECASE), "close_gripper"),
+    (re.compile(r"describe|look|see|observe|what.+see",              re.IGNORECASE), "observe"),
+    # Named-pose navigation: "go to place pose", "move to retract", etc.
+    (re.compile(r"\b(go\s+to|move\s+to|navigate\s+to)\s+\w",        re.IGNORECASE), "named_pose_move"),
+    # Relative Cartesian moves: "move forward 20 cm", "go up 10 cm"
+    (re.compile(r"\bmove\s+(forward|backward|left|right|up|down)\b", re.IGNORECASE), "cartesian_move"),
+    # Pose management
+    (re.compile(r"\bsave\s+(this|current|the)?\s*(pose|position)\b", re.IGNORECASE), "save_pose"),
+    (re.compile(r"\bdelete\s+\w+\s+pose\b|\brename\s+\w+",           re.IGNORECASE), "pose_management"),
 ]
 
 
-# ── Low-level helpers ──────────────────────────────────────────────────────────
+# ── Object label normalisation ─────────────────────────────────────────────────
+# Maps any synonym shape word onto a single canonical shape word so that
+# "red block" and "red cube" are stored as the same object.
+#
+# Rules applied in order by _normalise_object_label():
+#   1. Lowercase + collapse whitespace.
+#   2. Shape-word synonyms: block → cube  (both refer to the same small uniform object).
+#   3. Brand/description aliases: any label that contains "nvidia" or describes
+#      the large black box collapses to "nvidia box".
+#   4. Strip leading articles ("a ", "an ", "the ").
+
+_SHAPE_SYNONYMS: dict[str, str] = {
+    "block": "cube",
+}
+
+# Regex that matches any label containing "nvidia" or a verbose description of
+# the NVIDIA box (e.g. "black rectangular box with the nvidia logo …").
+_NVIDIA_ALIAS_RE = re.compile(
+    r"nvidia|black\s+rectangular\s+box",
+    re.IGNORECASE,
+)
+
+_ARTICLE_RE = re.compile(r"^(a|an|the)\s+", re.IGNORECASE)
+
+
+def _normalise_object_label(label: str) -> str:
+    """
+    Return a canonical, lowercase form of an object label.
+
+    Examples
+    --------
+    "Blue Block"          → "blue cube"
+    "red block"           → "red cube"
+    "NVIDIA cube"         → "nvidia box"
+    "nvidia cube"         → "nvidia box"
+    "black rectangular box with the NVIDIA logo …"
+                          → "nvidia box"
+    "A yellow cube"       → "yellow cube"
+    """
+    if not label:
+        return label
+
+    # 1. Lowercase + collapse internal whitespace
+    norm = " ".join(label.lower().split())
+
+    # 2. Strip leading article
+    norm = _ARTICLE_RE.sub("", norm).strip()
+
+    # 3. Brand/verbose-description aliases (before shape substitution so we
+    #    don't accidentally turn "nvidia block" into "nvidia cube" first)
+    if _NVIDIA_ALIAS_RE.search(norm):
+        return "nvidia box"
+
+    # 4. Shape-word substitution — only replaces whole words
+    for synonym, canonical in _SHAPE_SYNONYMS.items():
+        norm = re.sub(rf"\b{re.escape(synonym)}\b", canonical, norm)
+
+    return norm
+
+
 
 def _classify_task(query: str) -> str:
     for pattern, label in _TASK_PATTERNS:
@@ -92,7 +168,10 @@ def _classify_task(query: str) -> str:
 
 
 def _is_trivial(query: str) -> bool:
-    return any(p.fullmatch(query) for p in _TRIVIAL_QUERY_PATTERNS)
+    # Empty or whitespace-only queries are always trivial
+    if not query or not query.strip():
+        return True
+    return any(p.fullmatch(query.strip()) for p in _TRIVIAL_QUERY_PATTERNS)
 
 
 def _slim_output(tool_name: str, raw_output: str) -> str:
@@ -163,11 +242,21 @@ def _extract_outcome_fact(ep: dict) -> str:
     result_match = re.search(r"Result:\s*([^\n]+)", response, re.IGNORECASE)
     result_str   = result_match.group(1).strip() if result_match else outcome.upper()
 
+    # Retry annotation — shown on all task types when retries occurred
+    recorder_retries = ep.get("retries", {})
+    retry_count = recorder_retries.get("count", 0)
+    # Also check tool-call-based retries for pick/place
+    key_args_retries = ep.get("_key_args_retries", 0)
+    total_retries = max(retry_count, key_args_retries)
+    retry_s = (
+        f" (succeeded after {total_retries} retr{'ies' if total_retries != 1 else 'y'})"
+        if total_retries > 0 and outcome == "success"
+        else ""
+    )
+
     if task == "pick_and_place":
         key_args = _extract_key_args(ep)
         placements = key_args.get("placements", [])
-        retries    = key_args.get("retries", 0)
-        retry_s    = f" ({retries} retr{'ies' if retries != 1 else 'y'})" if retries else ""
         if len(placements) > 1:
             pairs = ", ".join(f"{p['picked']} → {p['placed_on']}" for p in placements)
             return f"Multi-place{retry_s}: {pairs}. {result_str}."
@@ -177,27 +266,49 @@ def _extract_outcome_fact(ep: dict) -> str:
 
     if task == "pick_only":
         key_args = _extract_key_args(ep)
-        obj    = key_args.get("picked_object", "object")
-        retries = key_args.get("retries", 0)
-        retry_s = f" ({retries} retr{'ies' if retries != 1 else 'y'})" if retries else ""
-        return f"{obj} grasped{retry_s}. {result_str}."
+        obj = key_args.get("picked_object", "object")
+        base = f"{obj} grasped{retry_s}. {result_str}."
+        grasp_assessment = ep.get("_grasp_assessment", "")
+        if grasp_assessment:
+            # Prepend a terse label so downstream readers know what this is
+            first_line = grasp_assessment.splitlines()[0]
+            base += f" Visual check: {first_line}"
+        return base
 
     if task == "home":
-        return f"Arm returned to home pose. {result_str}."
+        return f"Arm returned to home pose{retry_s}. {result_str}."
 
     if task in ("open_gripper", "close_gripper"):
         action = "opened" if task == "open_gripper" else "closed"
-        return f"Gripper {action}. {result_str}."
+        return f"Gripper {action}{retry_s}. {result_str}."
+
+    if task == "named_pose_move":
+        # Extract target pose name from query
+        m = re.search(r"\b(?:go\s+to|move\s+to|navigate\s+to)\s+(\w[\w\s]*)", query, re.IGNORECASE)
+        pose_name = m.group(1).strip() if m else "named pose"
+        return f"Moved to '{pose_name}'{retry_s}. {result_str}."
+
+    if task == "cartesian_move":
+        return f"{query.strip().capitalize()}{retry_s}. {result_str}."
+
+    if task == "save_pose":
+        # Try to extract the saved pose name
+        m = re.search(r"as\s+([\w\s]+?)(?:\s*$|\s*\.)", query, re.IGNORECASE)
+        pose_name = m.group(1).strip() if m else "pose"
+        return f"Saved pose '{pose_name}'{retry_s}. {result_str}."
+
+    if task == "pose_management":
+        return f"{query.strip().capitalize()}{retry_s}. {result_str}."
 
     # Generic fallback
-    return f"{query.strip().capitalize()}. {result_str}."
+    return f"{query.strip().capitalize()}{retry_s}. {result_str}."
 
 
 def _extract_seen_objects(ep: dict) -> list[str]:
     """
     Extract object labels seen during an episode from segment_objects outputs.
     These are the ground-truth labels used by the agent, so they're more
-    reliable for known_objects than free-text from describe_environment.
+    reliable for handled_objects than free-text from describe_environment.
     """
     labels: list[str] = []
     for tc in ep.get("tool_calls", []):
@@ -213,10 +324,134 @@ def _extract_seen_objects(ep: dict) -> list[str]:
             except Exception:
                 continue
         for item in obj.get("objects", []):
-            label = item.get("label")
+            label = _normalise_object_label(item.get("label", ""))
             if label and label not in labels:
                 labels.append(label)
     return labels
+
+
+def _extract_scene_object_labels(scene_text: str) -> list[str]:
+    """
+    Parse object labels from a free-text describe_environment scene description.
+
+    The model consistently uses numbered lists like:
+        "1. A red cube located on the left side."
+        "2. A blue cube located below the red cube."
+
+    We extract the noun phrase between "A/An" and the first locative verb
+    ("located", "positioned", "placed", "sitting", "resting", "on the", "at").
+    Falls back to splitting on commas for prose-style descriptions.
+
+    Returns a list of lowercase label strings, e.g. ["red cube", "blue cube"].
+    """
+    labels: list[str] = []
+
+    # Pattern 1: numbered list items — "1. A <label> located …"
+    list_item_re = re.compile(
+        r"^\s*\d+\.\s+[Aa]n?\s+(.+?)(?:\s+(?:located|positioned|placed|sitting|resting)\b|[,.]|$)",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    for m in list_item_re.finditer(scene_text):
+        label = _normalise_object_label(m.group(1).strip())
+        if label and label not in labels:
+            labels.append(label)
+
+    # Pattern 2: prose fallback — "there are a red cube, a blue cube and a yellow cube"
+    if not labels:
+        prose_re = re.compile(r"\ban?\s+([a-z][a-z\s]{2,30}?)(?=\s*(?:,|and\b|\.|$))", re.IGNORECASE)
+        for m in prose_re.finditer(scene_text):
+            label = _normalise_object_label(m.group(1).strip())
+            # Basic filter: reject single common words and over-long phrases
+            if 2 <= len(label.split()) <= 4 and label not in labels:
+                labels.append(label)
+
+    return labels
+
+
+def _extract_scene_description(ep: dict) -> tuple[str, str]:
+    """
+    Extract scene description and grasp-verification result separately.
+
+    Calls whose args.query matches _GRASP_VERIFY_PATTERN are outcome checks,
+    not scene snapshots. They are returned as the second element so they can
+    be folded into outcome_fact rather than polluting world_state.scene.
+
+    Returns:
+        (scene_desc, grasp_assessment)
+        scene_desc       – last general scene description (empty if none)
+        grasp_assessment – last grasp-verification result (empty if none)
+    """
+    last_scene = ""
+    last_grasp = ""
+    after_pick = False
+
+    for tc in ep.get("tool_calls", []):
+        tool = tc.get("tool", "")
+
+        # Mark boundary after a grasp/place action
+        if tool in ("grasp_object", "place_object", "pick_up_object"):
+            after_pick = True
+            continue
+
+        if tool != "describe_environment":
+            continue
+
+        query = tc.get("args", {}).get("query", "")
+        text = tc.get("output", "").strip()
+        if not text:
+            continue
+
+        if after_pick or _GRASP_VERIFY_PATTERN.search(query):
+            last_grasp = text[:200] + ("..." if len(text) > 200 else "")
+        else:
+            last_scene = text[:300] + ("..." if len(text) > 300 else "")
+
+    return last_scene, last_grasp
+
+
+def _extract_pose_mutations(ep: dict) -> list[dict]:
+    """
+    Extract pose registry mutations (save / delete / rename / list) from tool calls.
+    Returns a list of mutation dicts for use in derive_world_state.
+    """
+    mutations = []
+    for tc in ep.get("tool_calls", []):
+        tool = tc.get("tool", "")
+        args = tc.get("args", {})
+        try:
+            out = json.loads(tc.get("output", "{}"))
+        except Exception:
+            out = {}
+
+        if tool == "save_current_pose" and out.get("success"):
+            mutations.append({
+                "op":          "save",
+                "name":        out.get("name") or args.get("name", ""),
+                "description": args.get("description", ""),
+            })
+        elif tool == "delete_saved_pose" and out.get("success"):
+            mutations.append({
+                "op":   "delete",
+                "name": out.get("deleted") or args.get("name", ""),
+            })
+        elif tool == "rename_saved_pose" and out.get("success"):
+            parts = out.get("renamed", " -> ").split(" -> ")
+            if len(parts) == 2:
+                mutations.append({
+                    "op":      "rename",
+                    "old":     parts[0].strip(),
+                    "new":     parts[1].strip(),
+                })
+        elif tool == "list_saved_poses" and out.get("success"):
+            # list_saved_poses is a ground-truth snapshot — use it to seed known poses
+            mutations.append({
+                "op":    "list_snapshot",
+                "poses": {
+                    name: data.get("description", "")
+                    for name, data in out.get("poses", {}).items()
+                },
+            })
+    return mutations
 
 
 def _extract_key_args(ep: dict) -> dict:
@@ -260,7 +495,7 @@ def _extract_key_args(ep: dict) -> dict:
             q = args.get("query", "")
             # Non-question segment queries in the pick phase identify the target object
             if in_pick_phase and q and not re.search(r'\?', q):
-                candidate_pick = q
+                candidate_pick = _normalise_object_label(q)
 
         elif tool == "pick_up_object":
             pick_attempts += 1
@@ -270,7 +505,8 @@ def _extract_key_args(ep: dict) -> dict:
                 in_pick_phase = False   # now scanning for place target
 
         elif tool == "get_place_pose":
-            current_target = args.get("target_object_label")
+            raw_target = args.get("target_object_label")
+            current_target = _normalise_object_label(raw_target) if raw_target else None
 
         elif tool == "place_object":
             if success and current_held:
@@ -310,26 +546,27 @@ def summarise_episode(ep: dict) -> dict:
     key_args     = _extract_key_args(ep)
     task         = _classify_task(ep.get("query", ""))
     seen_objects = _extract_seen_objects(ep)
+    scene_desc, grasp_assessment = _extract_scene_description(ep)
+    pose_muts    = _extract_pose_mutations(ep)
 
-    # ── ADD THIS BLOCK ──────────────────────────────────────────────────────
-    # Pull structured retry data written by episode_recorder.record_retry().
-    # _extract_key_args() already counts retries from tool calls (pick attempts),
-    # but that only works for pick/place tasks. This covers ALL task types and
-    # also captures the failure reason and hint that was used.
+    # ── Retry data from episode_recorder.record_retry() ───────────────────────
+    # _extract_key_args() counts pick-attempt retries; record_retry() covers all
+    # task types. Use whichever count is larger.
     recorder_retries = ep.get("retries", {})
     retry_count = recorder_retries.get("count", 0)
-
-    # Only override if _extract_key_args didn't already find a higher number
-    # (the tool-call counter is more precise for pick/place; use whichever is larger)
     if retry_count > key_args.get("retries", 0):
         key_args["retries"] = retry_count
 
-    # Capture the last failure reason for outcome_fact on failed/retried episodes
+    # Stash tool-call retry count so _extract_outcome_fact can access it
+    ep["_key_args_retries"] = key_args.get("retries", 0)
+    # Stash grasp assessment so _extract_outcome_fact can append it for pick tasks
+    ep["_grasp_assessment"] = grasp_assessment
+
+    # Last failure reason from recorder — used for outcome_fact on failed episodes
     retry_attempts = recorder_retries.get("attempts", [])
     last_failure_reason = (
         retry_attempts[-1].get("failure_reason", "") if retry_attempts else ""
     )
-    # ── END OF ADDED BLOCK ──────────────────────────────────────────────────
 
     entry: dict = {
         "time":         ep.get("timestamp_start", "")[:19],
@@ -339,20 +576,25 @@ def summarise_episode(ep: dict) -> dict:
         "outcome":      ep.get("outcome", "unknown"),
         "outcome_fact": _extract_outcome_fact(ep),
         "tools":        seen,
+        # Internal field — used by derive_world_state, not injected into agent prompt
+        "_pose_mutations": pose_muts,
     }
+
     if seen_objects:
         entry["seen_objects"] = seen_objects
     if key_args:
         entry["key_args"] = key_args
+    if scene_desc:
+        entry["scene_description"] = scene_desc
+    if grasp_assessment:
+        entry["grasp_assessment"] = grasp_assessment
     if ep.get("error"):
         entry["error"] = ep["error"]
 
-    # ── ADD THIS LINE ───────────────────────────────────────────────────────
-    # Store the failure reason so _compute_failure_stats() in memory_context.py
-    # can read it as outcome_fact on failed/retried episodes
+    # For failed or retried episodes, replace generic outcome_fact with actual
+    # failure reason so _compute_failure_stats() gets useful cause strings
     if last_failure_reason and entry["outcome"] != "success":
         entry["outcome_fact"] = last_failure_reason
-    # ── END ─────────────────────────────────────────────────────────────────
 
     return entry
 
@@ -381,91 +623,79 @@ def derive_world_state(episodes: list[dict]) -> dict:
     """
     Infer the current world state from the ordered episode list.
 
-    Placement tracking uses a graph approach:
-      - sitting_on[obj] = base  means obj is currently resting on base
-      - When obj is picked up it is removed from the graph (it left its base)
-      - This correctly handles multiple independent stacks and rebuilds
-
-    The final stacks list contains one entry per independent tower, each
-    formatted bottom→top, e.g.:
-      [["red cube", "green cube"], ["yellow cube", "blue cube"]]
-
-    known_objects is populated from:
-      1. segment_objects outputs (structured, ground-truth labels)
+    handled_objects is populated from:
+      1. segment_objects outputs (structured, ground-truth labels) — objects
+         the robot has actually attempted to segment / grasp.
       2. pick/place key_args (placement targets also reveal object names)
+
+    scene_objects is populated from:
+      1. describe_environment outputs from observe episodes — every object
+         label mentioned in a general scene description.  These are parsed
+         with a simple heuristic and represent what the robot has *seen*,
+         regardless of whether it has ever touched them.
+
+    known_poses is populated from:
+      1. list_saved_poses snapshots (ground truth when present)
+      2. save_current_pose / delete_saved_pose / rename_saved_pose mutations
     """
     state: dict = {
-        "last_updated":  "",
-        "arm_pose":      "unknown",
-        "gripper":       "unknown",
-        "known_objects": [],
-        "stacks":        [],   # list of towers, each tower is [bottom, ..., top]
-        "notes":         [],
+        "last_updated":   "",
+        "arm_pose":       "unknown",
+        "gripper":        "unknown",
+        "handled_objects": [],   # objects the robot has segmented / grasped
+        "scene_objects":   [],   # objects seen in describe_environment scene snapshots
+        "known_poses":    {},    # name → description
+        "scene":          "",    # most recent *general* scene description (grasp-verification excluded)
+        "notes":          [],
     }
 
-    seen_objects: set[str] = set()
-
-    # sitting_on[obj] = base — tracks where each object currently rests.
-    # Forward pass: process episodes in chronological order so later actions
-    # overwrite earlier ones (pick removes, place adds).
-    sitting_on: dict[str, str] = {}
+    seen_objects:  set[str] = set()
+    scene_objects: set[str] = set()
+    known_poses: dict[str, str] = {}
 
     for ep in episodes:
         t     = ep.get("task_type")
         kargs = ep.get("key_args", {})
 
-        # Accumulate known objects from segment_objects outputs
-        for label in ep.get("seen_objects", []):
-            seen_objects.add(label)
+        # ── Scene description: always take the most recent ─────────────────────
+        if ep.get("scene_description"):
+            state["scene"] = ep["scene_description"]
 
-        # Also capture placement targets (may not have been segmented directly)
+        # ── Pose registry mutations ────────────────────────────────────────────
+        for mut in ep.get("_pose_mutations", []):
+            op = mut.get("op")
+            if op == "list_snapshot":
+                # Ground-truth snapshot from list_saved_poses — overwrite entirely
+                known_poses = dict(mut["poses"])
+            elif op == "save":
+                name = mut.get("name", "")
+                if name:
+                    known_poses[name] = mut.get("description", "")
+            elif op == "delete":
+                known_poses.pop(mut.get("name", ""), None)
+            elif op == "rename":
+                old, new = mut.get("old", ""), mut.get("new", "")
+                if old in known_poses:
+                    known_poses[new] = known_poses.pop(old)
+
+        # ── Handled objects (segmented / grasped) ─────────────────────────────
+        for label in ep.get("seen_objects", []):
+            seen_objects.add(_normalise_object_label(label))
+
         for p in kargs.get("placements", []):
             if p.get("picked"):
-                seen_objects.add(p["picked"])
+                seen_objects.add(_normalise_object_label(p["picked"]))
             if p.get("placed_on"):
-                seen_objects.add(p["placed_on"])
+                seen_objects.add(_normalise_object_label(p["placed_on"]))
+
+        # ── Scene objects (visible in describe_environment snapshots) ──────────
+        scene_text = ep.get("scene_description", "")
+        if scene_text:
+            for label in _extract_scene_object_labels(scene_text):
+                scene_objects.add(label)
 
         if ep["outcome"] != "success":
             continue
-
-        # Apply each pick→place pair to the sitting_on graph in order
-        placements = kargs.get("placements", [])
-        if not placements and t in ("pick_and_place", "pick_only"):
-            # Fallback for episodes without placements list (e.g. legacy data)
-            obj  = kargs.get("picked_object", "")
-            onto = kargs.get("placed_on", "")
-            if obj:
-                placements = [{"picked": obj, "placed_on": onto or None}]
-
-        for p in placements:
-            obj  = p.get("picked", "")
-            onto = p.get("placed_on")
-            if obj:
-                sitting_on.pop(obj, None)   # object was lifted off its previous base
-            if obj and onto:
-                sitting_on[obj] = onto      # object now rests on onto
-
-    # ── Build independent stacks from the sitting_on graph ────────────────────
-    # For each object that has nothing sitting on top of it (a "top" object),
-    # walk down the sitting_on chain to reconstruct the full tower.
-    all_tops = set(sitting_on.keys())          # objects that are ON something
-    all_bases = set(sitting_on.values())       # objects that have something ON them
-    top_objects = all_tops - all_bases         # objects with nothing on top = tower tops
-
-    stacks = []
-    for top in sorted(top_objects):           # sorted for deterministic output
-        tower = [top]
-        current = top
-        visited = {top}
-        while current in sitting_on:
-            base = sitting_on[current]
-            if base in visited:
-                break                          # cycle guard (shouldn't happen)
-            tower.append(base)
-            visited.add(base)
-            current = base
-        tower.reverse()                        # now bottom → top
-        stacks.append(tower)
 
     # ── Reverse pass for arm / gripper state (most recent wins) ───────────────
     for ep in reversed(episodes):
@@ -473,9 +703,17 @@ def derive_world_state(episodes: list[dict]) -> dict:
             state["last_updated"] = ep.get("time", "")
 
         t = ep.get("task_type")
+
         if state["arm_pose"] == "unknown":
-            if "move_to_home_pose" in ep.get("tools", []) and ep["outcome"] == "success":
+            if t == "home" and ep["outcome"] == "success":
                 state["arm_pose"] = "home"
+            elif t == "named_pose_move" and ep["outcome"] == "success":
+                # Extract destination from outcome_fact ("Moved to 'place_pose'. SUCCESS.")
+                m = re.search(r"Moved to '([^']+)'", ep.get("outcome_fact", ""))
+                if m:
+                    state["arm_pose"] = m.group(1)
+            elif t == "cartesian_move" and ep["outcome"] == "success":
+                state["arm_pose"] = "custom"
 
         if state["gripper"] == "unknown":
             if t == "open_gripper" and ep["outcome"] == "success":
@@ -483,15 +721,16 @@ def derive_world_state(episodes: list[dict]) -> dict:
             elif t == "close_gripper" and ep["outcome"] == "success":
                 state["gripper"] = "closed"
             elif t == "pick_and_place" and ep["outcome"] == "success":
-                state["gripper"] = "open"    # object released after place
+                state["gripper"] = "open"
             elif t == "pick_only" and ep["outcome"] == "success":
-                state["gripper"] = "closed"  # holding object
+                state["gripper"] = "closed"
 
         if state["arm_pose"] != "unknown" and state["gripper"] != "unknown":
             break
 
-    state["known_objects"] = sorted(seen_objects)
-    state["stacks"]        = stacks
+    state["handled_objects"] = sorted(seen_objects)
+    state["scene_objects"]   = sorted(scene_objects)
+    state["known_poses"]     = known_poses
 
     return state
 
@@ -503,6 +742,7 @@ def mine_procedures(episodes: list[dict]) -> dict:
     Derive canonical tool-call sequences from successful episodes
     grouped by task type.  For each task type, keep the most common
     (modal) sequence — that's the procedure the agent should follow.
+    Skips "other" since it's a catch-all with no coherent procedure.
     """
     from collections import Counter
 
@@ -511,16 +751,18 @@ def mine_procedures(episodes: list[dict]) -> dict:
         if ep["outcome"] != "success":
             continue
         task = ep.get("task_type", "other")
-        seq  = tuple(ep.get("tools", []))
+        if task == "other":
+            continue
+        seq = tuple(ep.get("tools", []))
+        if not seq:
+            continue
         buckets.setdefault(task, []).append(seq)
 
     procedures: dict = {}
     for task, seqs in buckets.items():
         if not seqs:
             continue
-        # Modal (most common) sequence
         modal_seq, count = Counter(seqs).most_common(1)[0]
-        # Compute an avg duration for this task type
         durations = [
             ep["duration_s"] for ep in episodes
             if ep.get("task_type") == task
@@ -530,10 +772,10 @@ def mine_procedures(episodes: list[dict]) -> dict:
         avg_dur = round(sum(durations) / len(durations), 1) if durations else None
 
         procedures[task] = {
-            "tool_sequence":    list(modal_seq),
-            "observed_count":   len(seqs),
-            "modal_count":      count,
-            "avg_duration_s":   avg_dur,
+            "tool_sequence":  list(modal_seq),
+            "observed_count": len(seqs),
+            "modal_count":    count,
+            "avg_duration_s": avg_dur,
         }
 
     return procedures
@@ -561,12 +803,17 @@ def build_summary(session_files: list[Path], top_k: int | None = None) -> dict:
     # ── Layer 2: recent meaningful episodes ───────────────────────────────────
     meaningful = [ep for ep in all_episodes if not _is_trivial(ep["query"])]
 
+    # Strip internal fields before storing (not needed downstream)
+    for ep in meaningful:
+        ep.pop("_pose_mutations", None)
+        ep.pop("_key_args_retries", None)
+
     if top_k and len(meaningful) > top_k:
         meaningful = meaningful[-top_k:]
 
     # ── Stats (over all episodes, including trivial) ──────────────────────────
-    success  = sum(1 for e in all_episodes if e["outcome"] == "success")
-    errors   = sum(1 for e in all_episodes if e["outcome"] == "error")
+    success = sum(1 for e in all_episodes if e["outcome"] == "success")
+    errors  = sum(1 for e in all_episodes if e["outcome"] == "error")
     valid_durations = [e["duration_s"] for e in all_episodes if e["duration_s"] is not None]
     avg_dur = sum(valid_durations) / len(valid_durations) if valid_durations else 0
 
@@ -609,8 +856,10 @@ def to_text(summary: dict) -> str:
     lines = [
         f"# Agent Memory — generated {summary.get('generated_at', '')}",
         f"# arm={ws.get('arm_pose','?')}  gripper={ws.get('gripper','?')}",
-        f"# stacks: {' | '.join(' > '.join(t) for t in ws.get('stacks', [])) or '—'}",
-        f"# known objects: {', '.join(ws.get('known_objects', [])) or '—'}",
+        f"# handled objects: {', '.join(ws.get('handled_objects', [])) or '—'}",
+        f"# scene objects:   {', '.join(ws.get('scene_objects', [])) or '—'}",
+        f"# known poses: {', '.join(ws.get('known_poses', {}).keys()) or '—'}",
+        f"# scene: {ws.get('scene', '—')[:120]}",
         "",
         "# PROCEDURES",
     ]
@@ -669,7 +918,7 @@ def main():
         txt_path.write_text(to_text(summary), encoding="utf-8")
         print(f"Text summary → {txt_path}")
 
-    s = summary["stats"]
+    s  = summary["stats"]
     ws = summary["world_state"]
     print(f"\nStats: {s['total_episodes']} total episodes | "
           f"{s['meaningful_episodes']} meaningful | "
@@ -677,10 +926,11 @@ def main():
     print(f"       {s['successful']} success | {s['errors']} errors | "
           f"avg {s['average_duration_s']}s/episode")
     print(f"World state: arm={ws['arm_pose']} | gripper={ws['gripper']}")
-    if ws.get("stacks"):
-        for i, tower in enumerate(ws["stacks"], 1):
-            print(f"Stack {i} (bottom→top): {' > '.join(tower)}")
-    print("Procedures mined:", ", ".join(summary["procedures"].keys()))
+    if ws.get("known_poses"):
+        print(f"Known poses: {', '.join(ws['known_poses'].keys())}")
+    if ws.get("scene"):
+        print(f"Last scene: {ws['scene'][:100]}…")
+    print("Procedures mined:", ", ".join(summary["procedures"].keys()) or "none")
 
 
 if __name__ == "__main__":

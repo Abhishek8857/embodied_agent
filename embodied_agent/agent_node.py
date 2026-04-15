@@ -15,6 +15,7 @@ from .utils.episode_recorder import EpisodeRecorder
 from .utils.recovery_advisor import RecoveryAdvisor
 from .utils.episode_summarizer import build_summary
 from .config import get_config
+from .llm import get_qwen_llm  
 from .context import Context
 
 from pathlib import Path
@@ -56,9 +57,19 @@ class Agent(Node):
 
         self.recorder = EpisodeRecorder(save_dir=EPISODES_DIR)
         self.get_logger().info(f"Episode recorder session: {self.recorder.session_id}")
-        self.recovery_advisor = RecoveryAdvisor(recorder=self.recorder, memory_path=MEMORY_DIR / "memory.json",)
 
-        self.get_logger().info("Agent node initialised!")
+        # Toggle: set to False to disable the RecoveryAdvisor and retry with plain context only
+        self.use_recovery_advisor: bool = False
+
+        self.recovery_advisor = RecoveryAdvisor(
+            recorder=self.recorder,
+            llm=get_qwen_llm(),
+            memory_path=MEMORY_DIR / "memory.json",
+        ) if self.use_recovery_advisor else None
+
+        self.get_logger().info(
+            f"Agent node initialised! (recovery_advisor={'enabled' if self.use_recovery_advisor else 'disabled'})"
+        )
         self.message_recieved: bool = False
 
 
@@ -100,27 +111,47 @@ class Agent(Node):
                     break
 
                 if attempt < max_attempts:
-                    hint = self.recovery_advisor.get_hint(
-                        failure_reason=failure,
-                        query=user_query,
-                    )
-                    # Record the retry inside the episode before re-invoking
+                    # Resolve hint only when the advisor is enabled
+                    if self.use_recovery_advisor and self.recovery_advisor is not None:
+                        hint = self.recovery_advisor.get_hint(
+                            failure_reason=failure,
+                            query=user_query,
+                        )
+                    else:
+                        hint = None
+
                     episode.record_retry(
                         attempt=attempt,
                         failure_reason=failure,
                         hint_used=hint,
                     )
-                    self.get_logger().warning(
-                        f"Attempt {attempt} failed: {failure}. Retrying with hint: {bool(hint)}"
-                    )
-                    invoke_message = format_message(
-                        f"[RETRY — Attempt {attempt + 1}/{max_attempts}]\n"
-                        f"The previous attempt did not complete the task.\n"
-                        f"Reason: {failure}\n\n"
-                        f"{hint}\n\n" if hint else ""
-                        f"Return to home pose, then re-execute the original task:\n"
-                        f"{user_query}"
-                    )
+
+                    if hint:
+                        self.get_logger().warning(
+                            f"Attempt {attempt} failed: {failure}. Retrying with hint: {hint}"
+                        )
+                        retry_body = (
+                            f"[RETRY — Attempt {attempt + 1}/{max_attempts}]\n"
+                            f"The previous attempt did not complete the task. Return to Home pose.\n"
+                            f"Reason: {failure}\n\n"
+                            f"{hint}\n\n"
+                            f"ALWAYS return to home pose first, then re-execute the original task:\n"
+                            f"{user_query}"
+                        )
+                    else:
+                        self.get_logger().warning(
+                            f"Attempt {attempt} failed: {failure}. Retrying without hint."
+                        )
+                        retry_body = (
+                            f"[RETRY — Attempt {attempt + 1}/{max_attempts}]\n"
+                            f"The previous attempt did not complete the task. Return to Home pose.\n"
+                            f"Reason: {failure}\n\n"
+                            f"ALWAYS return to home pose first, then re-execute the original task:\n"
+                            f"{user_query}"
+                        )
+
+                    invoke_message = format_message(retry_body)
+
                 else:
                     self.get_logger().error(
                         f"All {max_attempts} attempts failed. Last failure: {failure}"
