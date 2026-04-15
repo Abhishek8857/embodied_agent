@@ -1,21 +1,21 @@
 """
-memory_summarizer.py  (v2)
---------------------------
+memory_summarizer.py  (navigation stack)
+-----------------------------------------
 Reads multiple episodic memory session JSON files and produces a two-layer
-memory file optimised for injecting into an agent's context window.
+memory file optimised for injecting into a wheeled navigation agent's context.
 
 Layer 1 – High-signal, injected every call (small):
-  world_state   current scene facts derived from the most recent episodes
+  world_state   current pose and last known location derived from recent episodes
   procedures    canonical tool chains mined from successful episodes
 
 Layer 2 – Recent context, injected for novel/recovery situations:
-  recent_episodes  last N *meaningful* episodes (trivial homing stripped out)
+  recent_episodes  last N *meaningful* episodes (trivial info queries stripped)
   stats            tool frequency, success rates
 
 Output
 ------
-  memory_summary.json   full two-layer structure
-  memory_summary.txt    ultra-compact one-liner-per-episode version (--txt)
+  memory.json       full two-layer structure
+  memory.txt        ultra-compact one-liner-per-episode version (--txt)
 
 Usage
 -----
@@ -33,28 +33,20 @@ from datetime import datetime
 from pathlib import Path
 
 
-# ── Constants ──────────────────────────────────────────────────────────────────
-
 _BLOCKLIST_KEYS = {
     "mask", "mask_array", "feedback", "sent_data",
-    "rgb_shape", "depth_shape", "segmap_shape", "segmap_unique",
-    "visualizations", "individual_masks",
+    "rgb_shape", "depth_shape",
 }
 
+# Keys to keep from each tool's output — everything else is dropped to save tokens.
 _SLIM_OUTPUT_KEYS: dict[str, list[str]] = {
-    "segment_objects":                    ["count", "objects.label", "objects.grasp_center_3d"],
-    "get_latest_grasp_pose":              ["success", "x", "y", "z"],
-    "get_place_pose":                     ["success", "x", "y", "z", "object_label"],
-    "grasp_object":                       ["success", "final_status"],
-    "place_object":                       ["success", "final_status"],
-    "move_to_home_pose":                  ["success", "final_status", "elapsed_s"],
-    "move_to_pose":                       ["success", "final_status"],
-    "get_current_joint_states":           ["success"],
-    "capture_rgbd":                       ["success", "path"],
-    "capture_only_rgb_image":             ["success", "path"],
-    "save_segmentation_for_graspnet":     ["success", "num_objects"],
-    "describe_what_you_see":              ["__text_truncate_200__"],
-    "describe_environment":               ["__text_truncate_200__"],
+    "navigate_to_location": ["success", "status", "message"],
+    "get_current_pose":     ["success", "x", "y", "yaw_degrees"],
+    "relative_move":        ["success", "x", "y", "yaw_degrees"],
+    "save_location":        ["success", "name"],
+    "delete_location":      ["success", "name"],
+    "list_locations":       ["success", "locations"],
+    "cancel_navigation":    ["success"],
 }
 
 # Queries that are operationally trivial and low-signal for future planning.
@@ -62,26 +54,26 @@ _SLIM_OUTPUT_KEYS: dict[str, list[str]] = {
 _TRIVIAL_QUERY_PATTERNS = [
     re.compile(p, re.IGNORECASE)
     for p in [
-        r"^\s*go\s+home\s*$",
-        r"^\s*home\s*$",
-        r"^\s*return\s+(to\s+)?home\s*$",
-        r"^\s*open\s+gripper\s*$",
-        r"^\s*close\s+gripper\s*$",
+        r"^\s*what\s+can\s+you\s+do\s*$",
+        r"^\s*help\s*$",
+        r"^\s*what\s+location(s)?\s+(do\s+you\s+know|are\s+(there|available))\s*$",
+        r"^\s*list\s+location(s)?\s*$",
     ]
 ]
 
 # Task-type classifiers  (query → procedure key)
 _TASK_PATTERNS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"pick.*place|place.*on|stack|put.*on", re.IGNORECASE), "pick_and_place"),
-    (re.compile(r"pick\s+up|grasp|grab",               re.IGNORECASE), "pick_only"),
-    (re.compile(r"go\s+home|home\s+pose|return\s+home", re.IGNORECASE), "home"),
-    (re.compile(r"open\s+gripper",                      re.IGNORECASE), "open_gripper"),
-    (re.compile(r"close\s+gripper",                     re.IGNORECASE), "close_gripper"),
-    (re.compile(r"describe|look|see|observe|what.+see", re.IGNORECASE), "observe"),
+    (re.compile(r"go\s+back\s+to\s+home|go\s+home|home\s+pose|return\s+(to\s+)?home", re.IGNORECASE), "home"),
+    (re.compile(r"navigate|go\s+to|take\s+me|move\s+to|drive\s+to",                   re.IGNORECASE), "navigate"),
+    (re.compile(r"move\s+forward|move\s+back(ward)?|go\s+(left|right|straight)",       re.IGNORECASE), "relative_move"),
+    (re.compile(r"turn\s+(left|right)|rotate|spin",                                    re.IGNORECASE), "rotate"),
+    (re.compile(r"save\s+(this|location|spot|pose|here)|remember\s+this",             re.IGNORECASE), "save_location"),
+    (re.compile(r"delete|remove\s+(location|spot|waypoint)",                           re.IGNORECASE), "delete_location"),
+    (re.compile(r"stop|cancel|abort|halt",                                             re.IGNORECASE), "stop"),
+    (re.compile(r"where\s+am\s+i|current\s+pose|current\s+position",                  re.IGNORECASE), "query_pose"),
 ]
 
 
-# ── Low-level helpers ──────────────────────────────────────────────────────────
 
 def _classify_task(query: str) -> str:
     for pattern, label in _TASK_PATTERNS:
@@ -97,19 +89,10 @@ def _is_trivial(query: str) -> bool:
 def _slim_output(tool_name: str, raw_output: str) -> str:
     spec = _SLIM_OUTPUT_KEYS.get(tool_name)
 
-    if spec == ["__text_truncate_200__"]:
-        text = raw_output.strip()
-        return text[:200] + ("…" if len(text) > 200 else "")
-
     try:
         obj = json.loads(raw_output)
     except (json.JSONDecodeError, TypeError):
-        try:
-            cleaned = re.sub(r"array\([^)]*\)", '"<array>"', raw_output, flags=re.DOTALL)
-            obj = eval(cleaned, {"__builtins__": {}},
-                       {"False": False, "True": True, "None": None})
-        except Exception:
-            return raw_output[:200]
+        return raw_output[:200]
 
     if not isinstance(obj, dict):
         return str(obj)[:200]
@@ -117,25 +100,14 @@ def _slim_output(tool_name: str, raw_output: str) -> str:
     obj = {k: v for k, v in obj.items() if k not in _BLOCKLIST_KEYS}
 
     if spec:
-        slim = {}
-        for key in spec:
-            if "." in key:
-                parent, child = key.split(".", 1)
-                parent_val = obj.get(parent, [])
-                if isinstance(parent_val, list):
-                    slim[key] = [item.get(child) for item in parent_val if isinstance(item, dict)]
-                else:
-                    slim[key] = parent_val
-            elif key in obj:
-                slim[key] = obj[key]
+        slim = {k: obj[k] for k in spec if k in obj}
         return json.dumps(slim)
 
     return json.dumps(obj)
 
 
 def _slim_args(args: dict) -> dict:
-    return {k: v for k, v in args.items()
-            if k not in _BLOCKLIST_KEYS and (not isinstance(v, list) or k == "query")}
+    return {k: v for k, v in args.items() if k not in _BLOCKLIST_KEYS}
 
 
 def _first_sentence(text: str) -> str:
@@ -148,11 +120,8 @@ def _first_sentence(text: str) -> str:
 
 def _extract_outcome_fact(ep: dict) -> str:
     """
-    Build a terse factual outcome sentence from the structured episode data
-    rather than parroting the agent's own verbose narration.
-
-    Priority: use verification lines from final_response if present,
-    otherwise synthesise from key_args and outcome.
+    Build a terse factual outcome sentence from the structured episode data.
+    Pulls the "Result:" line from the final_response where available.
     """
     query    = ep.get("query", "")
     outcome  = ep.get("outcome", "unknown")
@@ -160,68 +129,82 @@ def _extract_outcome_fact(ep: dict) -> str:
     task     = _classify_task(query)
     key_args = _extract_key_args(ep)
 
-    # Try to extract a "Result: X" line from the response
-    result_match = re.search(r"Result:\s*([^\n]+)", response, re.IGNORECASE)
+    # Try to extract a "Result:" line from the agent's response JSON
+    try:
+        resp_data = json.loads(response)
+        response_text = resp_data.get("response", response)
+    except (json.JSONDecodeError, TypeError):
+        response_text = response
+
+    result_match = re.search(r"Result:\s*([^\n]+)", response_text, re.IGNORECASE)
     result_str   = result_match.group(1).strip() if result_match else outcome.upper()
 
-    if task == "pick_and_place":
-        obj      = key_args.get("picked_object", "object")
-        target   = key_args.get("placed_on", "target")
-        retries  = key_args.get("retries", 0)
-        retry_s  = f" ({retries} retr{'ies' if retries != 1 else 'y'})" if retries else ""
-        return f"{obj} picked and placed on {target}{retry_s}. {result_str}."
+    location = key_args.get("location_name", "")
 
-    if task == "pick_only":
-        obj    = key_args.get("picked_object", "object")
-        retries = key_args.get("retries", 0)
-        retry_s = f" ({retries} retr{'ies' if retries != 1 else 'y'})" if retries else ""
-        return f"{obj} grasped{retry_s}. {result_str}."
+    if task == "navigate":
+        loc_str = f" to {location}" if location else ""
+        return f"Navigate{loc_str}. {result_str}."
 
     if task == "home":
-        return f"Arm returned to home pose. {result_str}."
+        return f"Return to home. {result_str}."
 
-    if task in ("open_gripper", "close_gripper"):
-        action = "opened" if task == "open_gripper" else "closed"
-        return f"Gripper {action}. {result_str}."
+    if task == "relative_move":
+        dist_x = key_args.get("distance_x", "")
+        dist_y = key_args.get("distance_y", "")
+        move_str = ""
+        if dist_x:
+            move_str += f" forward {dist_x}m"
+        if dist_y:
+            move_str += f" lateral {dist_y}m"
+        return f"Relative move{move_str}. {result_str}."
+
+    if task == "rotate":
+        angle = key_args.get("angle_degrees", "")
+        angle_str = f" {angle}°" if angle else ""
+        return f"Rotate{angle_str}. {result_str}."
+
+    if task == "save_location":
+        return f"Saved location '{location}'. {result_str}."
+
+    if task == "delete_location":
+        return f"Deleted location '{location}'. {result_str}."
 
     # Generic fallback
     return f"{query.strip().capitalize()}. {result_str}."
 
 
 def _extract_key_args(ep: dict) -> dict:
-    """Richer key-args extraction: objects, placement targets, retry count."""
+    """Extract navigation-relevant arguments from tool calls."""
     key_args: dict = {}
     tool_calls = ep.get("tool_calls", [])
 
-    segmented: list[str] = []
-    retries = 0
     for tc in tool_calls:
         args = tc.get("args", {})
-        tool = tc["tool"]
+        tool = tc.get("tool", "")
 
-        # Segment queries reveal object names (filter out visual QA strings)
-        if "query" in args:
-            q = args["query"]
-            if not re.search(r'\?', q):   # skip "Is the X in the gripper?" checks
-                if q not in segmented:
-                    segmented.append(q)
+        if tool == "navigate_to_location":
+            if "location_name" in args:
+                key_args["location_name"] = args["location_name"]
 
-        if "target_object_label" in args:
-            key_args["placed_on"] = args["target_object_label"]
+        elif tool == "relative_move":
+            if "distance_x" in args:
+                key_args["distance_x"] = args["distance_x"]
+            if "distance_y" in args:
+                key_args["distance_y"] = args["distance_y"]
 
-        # Count pick_up_object calls beyond the first as retries
-        if tool == "pick_up_object":
-            retries += 1
+        elif tool in ("save_location", "delete_location"):
+            if "name" in args:
+                key_args["location_name"] = args["name"]
+            elif "location_name" in args:
+                key_args["location_name"] = args["location_name"]
 
-    if segmented:
-        key_args["picked_object"] = segmented[0]
-    if retries > 1:
-        key_args["retries"] = retries - 1   # first attempt isn't a retry
+        elif tool == "rotate":
+            if "angle_degrees" in args:
+                key_args["angle_degrees"] = args["angle_degrees"]
 
     return key_args
 
 
-# ── Episode summarisation ──────────────────────────────────────────────────────
 
 def summarise_episode(ep: dict) -> dict:
     """Convert one full episode dict into a compact summary dict."""
@@ -264,117 +247,149 @@ def summarise_session(path: Path) -> tuple[dict, list[dict]]:
     return meta, episodes
 
 
-# ── World-state extractor ──────────────────────────────────────────────────────
 
 def derive_world_state(episodes: list[dict]) -> dict:
     """
-    Infer the current world state from the ordered episode list.
+    Infer the current navigation world state from the ordered episode list.
 
-    Placement tracking uses a graph approach:
-      - sitting_on[obj] = base  means obj is currently resting on base
-      - When obj is picked up it is removed from the graph (it left its base)
-      - This correctly handles multiple independent stacks and rebuilds
-
-    The final stacks list contains one entry per independent tower, each
-    formatted bottom→top, e.g.:
-      [["red cube", "green cube"], ["yellow cube", "blue cube"]]
+    Tracks:
+      - current_pose: last known (x, y, yaw_degrees) from get_current_pose
+      - last_location: name of the last successfully navigated-to location
+      - known_locations: all location names ever successfully navigated to or saved
+      - notes: any extra context
     """
     state: dict = {
-        "last_updated":  "",
-        "arm_pose":      "unknown",
-        "gripper":       "unknown",
-        "known_objects": [],
-        "stacks":        [],   # list of towers, each tower is [bottom, ..., top]
-        "notes":         [],
+        "last_updated":   "",
+        "current_pose":   {"x": None, "y": None, "yaw_degrees": None},
+        "last_location":  None,
+        "known_locations": [],
+        "notes":          [],
     }
 
-    seen_objects: set[str] = set()
+    seen_locations: set[str] = set()
 
-    # sitting_on[obj] = base — tracks where each object currently rests.
-    # Forward pass: process episodes in chronological order so later actions
-    # overwrite earlier ones (pick removes, place adds).
-    sitting_on: dict[str, str] = {}
-
+    # Forward pass — collect all known locations from successful navigate/save episodes
     for ep in episodes:
-        t     = ep.get("task_type")
+        task  = ep.get("task_type")
         kargs = ep.get("key_args", {})
-        obj   = kargs.get("picked_object", "")
-        onto  = kargs.get("placed_on", "")
+        loc   = kargs.get("location_name", "")
 
-        if obj:
-            seen_objects.add(obj)
-        if onto:
-            seen_objects.add(onto)
+        if loc and ep["outcome"] == "success" and task in ("navigate", "home", "save_location"):
+            seen_locations.add(loc)
 
-        if ep["outcome"] != "success":
-            continue
-
-        if t in ("pick_and_place", "pick_only") and obj:
-            # Object was lifted — it is no longer sitting on anything
-            sitting_on.pop(obj, None)
-
-        if t == "pick_and_place" and obj and onto:
-            # Object was placed onto a base
-            sitting_on[obj] = onto
-
-    # ── Build independent stacks from the sitting_on graph ────────────────────
-    # For each object that has nothing sitting on top of it (a "top" object),
-    # walk down the sitting_on chain to reconstruct the full tower.
-    all_tops = set(sitting_on.keys())          # objects that are ON something
-    all_bases = set(sitting_on.values())       # objects that have something ON them
-    top_objects = all_tops - all_bases         # objects with nothing on top = tower tops
-
-    stacks = []
-    for top in sorted(top_objects):           # sorted for deterministic output
-        tower = [top]
-        current = top
-        visited = {top}
-        while current in sitting_on:
-            base = sitting_on[current]
-            if base in visited:
-                break                          # cycle guard (shouldn't happen)
-            tower.append(base)
-            visited.add(base)
-            current = base
-        tower.reverse()                        # now bottom → top
-        stacks.append(tower)
-
-    # ── Reverse pass for arm / gripper state (most recent wins) ───────────────
+    # Reverse pass — most recent episode wins for pose and last_location
     for ep in reversed(episodes):
         if not state["last_updated"]:
             state["last_updated"] = ep.get("time", "")
 
-        t = ep.get("task_type")
-        if state["arm_pose"] == "unknown":
-            if "move_to_home_pose" in ep.get("tools", []) and ep["outcome"] == "success":
-                state["arm_pose"] = "home"
+        task  = ep.get("task_type")
+        kargs = ep.get("key_args", {})
 
-        if state["gripper"] == "unknown":
-            if t == "open_gripper" and ep["outcome"] == "success":
-                state["gripper"] = "open"
-            elif t == "close_gripper" and ep["outcome"] == "success":
-                state["gripper"] = "closed"
-            elif t == "pick_and_place" and ep["outcome"] == "success":
-                state["gripper"] = "open"    # object released after place
-            elif t == "pick_only" and ep["outcome"] == "success":
-                state["gripper"] = "closed"  # holding object
+        # Extract pose from get_current_pose tool output (most recent successful nav)
+        if state["current_pose"]["x"] is None and ep["outcome"] == "success":
+            for tc in ep.get("tool_calls", []) if False else []:
+                pass  # handled below via key_args fallback
 
-        if state["arm_pose"] != "unknown" and state["gripper"] != "unknown":
+            # Pull pose directly from tool call outputs in the episode
+            if hasattr(ep, "_raw_tool_calls"):
+                for tc in ep["_raw_tool_calls"]:
+                    if tc.get("tool") == "get_current_pose":
+                        try:
+                            out = json.loads(tc.get("output", "{}"))
+                            if out.get("success"):
+                                state["current_pose"] = {
+                                    "x":           out.get("x"),
+                                    "y":           out.get("y"),
+                                    "yaw_degrees": out.get("yaw_degrees"),
+                                }
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+
+        # Last navigated location
+        if state["last_location"] is None and ep["outcome"] == "success":
+            if task in ("navigate", "home") and kargs.get("location_name"):
+                state["last_location"] = kargs["location_name"]
+
+        if state["last_location"] is not None and state["current_pose"]["x"] is not None:
             break
 
-    state["known_objects"] = sorted(seen_objects)
-    state["stacks"]        = stacks
-
+    state["known_locations"] = sorted(seen_locations)
     return state
 
 
-# ── Procedure miner ────────────────────────────────────────────────────────────
+def derive_world_state_from_raw(all_raw_episodes: list[dict]) -> dict:
+    """
+    Richer world state extraction that reads tool call outputs directly
+    from the raw session episode dicts
+    """
+    state: dict = {
+        "last_updated":    "",
+        "current_pose":    {"x": None, "y": None, "yaw_degrees": None},
+        "last_location":   None,
+        "known_locations": [],
+        "notes":           [],
+    }
+
+    seen_locations: set[str] = set()
+
+    for ep in all_raw_episodes:
+        task  = _classify_task(ep.get("query", ""))
+        loc   = ""
+        for tc in ep.get("tool_calls", []):
+            if tc.get("tool") == "navigate_to_location":
+                loc = tc.get("args", {}).get("location_name", "")
+        if loc and ep.get("outcome") == "success" and task in ("navigate", "home"):
+            seen_locations.add(loc)
+        # save_location
+        for tc in ep.get("tool_calls", []):
+            if tc.get("tool") == "save_location" and ep.get("outcome") == "success":
+                name = tc.get("args", {}).get("name", tc.get("args", {}).get("location_name", ""))
+                if name:
+                    seen_locations.add(name)
+            if tc.get("tool") == "delete_location" and ep.get("outcome") == "success":
+                name = tc.get("args", {}).get("name", tc.get("args", {}).get("location_name", ""))
+                seen_locations.discard(name)
+
+    # Reverse pass for current pose and last location
+    for ep in reversed(all_raw_episodes):
+        if not state["last_updated"]:
+            state["last_updated"] = ep.get("timestamp_start", ep.get("time", ""))[:19]
+
+        if state["current_pose"]["x"] is None and ep.get("outcome") == "success":
+            for tc in ep.get("tool_calls", []):
+                if tc.get("tool") == "get_current_pose":
+                    try:
+                        out = json.loads(tc.get("output", "{}"))
+                        if out.get("success"):
+                            state["current_pose"] = {
+                                "x":           out.get("x"),
+                                "y":           out.get("y"),
+                                "yaw_degrees": out.get("yaw_degrees"),
+                            }
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+        if state["last_location"] is None and ep.get("outcome") == "success":
+            task = _classify_task(ep.get("query", ""))
+            if task in ("navigate", "home"):
+                for tc in ep.get("tool_calls", []):
+                    if tc.get("tool") == "navigate_to_location":
+                        loc = tc.get("args", {}).get("location_name", "")
+                        if loc:
+                            state["last_location"] = loc
+                            break
+
+        if state["last_location"] is not None and state["current_pose"]["x"] is not None:
+            break
+
+    state["known_locations"] = sorted(seen_locations)
+    return state
+
 
 def mine_procedures(episodes: list[dict]) -> dict:
     """
     Derive canonical tool-call sequences from successful episodes
-    grouped by task type.  For each task type, keep the most common
-    (modal) sequence — that's the procedure the agent should follow.
+    grouped by task type.
     """
     from collections import Counter
 
@@ -390,9 +405,7 @@ def mine_procedures(episodes: list[dict]) -> dict:
     for task, seqs in buckets.items():
         if not seqs:
             continue
-        # Modal (most common) sequence
         modal_seq, count = Counter(seqs).most_common(1)[0]
-        # Compute an avg duration for this task type
         durations = [
             ep["duration_s"] for ep in episodes
             if ep.get("task_type") == task
@@ -402,41 +415,43 @@ def mine_procedures(episodes: list[dict]) -> dict:
         avg_dur = round(sum(durations) / len(durations), 1) if durations else None
 
         procedures[task] = {
-            "tool_sequence":    list(modal_seq),
-            "observed_count":   len(seqs),
-            "modal_count":      count,
-            "avg_duration_s":   avg_dur,
+            "tool_sequence":  list(modal_seq),
+            "observed_count": len(seqs),
+            "modal_count":    count,
+            "avg_duration_s": avg_dur,
         }
 
     return procedures
 
 
-# ── Main aggregator ────────────────────────────────────────────────────────────
 
 def build_summary(session_files: list[Path], top_k: int | None = None) -> dict:
-    all_episodes: list[dict] = []
+    all_raw_episodes: list[dict] = []
+    all_episodes:     list[dict] = []
 
     for path in sorted(session_files):
-        _, episodes = summarise_session(path)
-        all_episodes.extend(episodes)
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        raw_eps = data.get("episodes", [])
+        all_raw_episodes.extend(raw_eps)
+        _, summarised = summarise_session(path)
+        all_episodes.extend(summarised)
 
     # Sort chronologically
     all_episodes.sort(key=lambda e: e["time"])
+    all_raw_episodes.sort(key=lambda e: e.get("timestamp_start", ""))
 
     if not all_episodes:
         return {}
 
-    # ── Layer 1: world state & procedures (derived from ALL episodes) ──────────
-    world_state = derive_world_state(all_episodes)
+    world_state = derive_world_state_from_raw(all_raw_episodes)
     procedures  = mine_procedures(all_episodes)
 
-    # ── Layer 2: recent meaningful episodes ───────────────────────────────────
     meaningful = [ep for ep in all_episodes if not _is_trivial(ep["query"])]
 
     if top_k and len(meaningful) > top_k:
         meaningful = meaningful[-top_k:]
 
-    # ── Stats (over all episodes, including trivial) ──────────────────────────
     success  = sum(1 for e in all_episodes if e["outcome"] == "success")
     errors   = sum(1 for e in all_episodes if e["outcome"] == "error")
     avg_dur  = (sum(e["duration_s"] or 0 for e in all_episodes) / len(all_episodes)
@@ -455,12 +470,9 @@ def build_summary(session_files: list[Path], top_k: int | None = None) -> dict:
 
     return {
         "generated_at": datetime.now().isoformat()[:19],
-        # ── Layer 1 ──────────────────────────────────────────────────────────
-        "world_state": world_state,
-        "procedures":  procedures,
-        # ── Layer 2 ──────────────────────────────────────────────────────────
-        "recent_episodes": meaningful,
-        # ── Meta ─────────────────────────────────────────────────────────────
+        "world_state":      world_state,
+        "procedures":       procedures,
+        "recent_episodes":  meaningful,
         "stats": {
             "total_episodes":          len(all_episodes),
             "meaningful_episodes":     len(meaningful),
@@ -474,15 +486,17 @@ def build_summary(session_files: list[Path], top_k: int | None = None) -> dict:
     }
 
 
-# ── Text formatter ─────────────────────────────────────────────────────────────
 
 def to_text(summary: dict) -> str:
     ws = summary.get("world_state", {})
+    pose = ws.get("current_pose", {})
+    pose_str = (f"x={pose.get('x')}, y={pose.get('y')}, yaw={pose.get('yaw_degrees')}°"
+                if pose.get("x") is not None else "unknown")
     lines = [
         f"# Agent Memory — generated {summary.get('generated_at', '')}",
-        f"# arm={ws.get('arm_pose','?')}  gripper={ws.get('gripper','?')}",
-        f"# stacks: {' | '.join(' > '.join(t) for t in ws.get('stacks', [])) or '—'}",
-        f"# known objects: {', '.join(ws.get('known_objects', [])) or '—'}",
+        f"# pose={pose_str}",
+        f"# last_location={ws.get('last_location', '?')}",
+        f"# known_locations: {', '.join(ws.get('known_locations', [])) or '—'}",
         "",
         "# PROCEDURES",
     ]
@@ -501,13 +515,12 @@ def to_text(summary: dict) -> str:
     return "\n".join(lines)
 
 
-# ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Summarise episodic memory session files.")
     parser.add_argument("--dir",   default="memory", help="Directory containing session JSON files")
     parser.add_argument("--files", nargs="+",        help="Explicit list of session JSON files")
-    parser.add_argument("--out",   default="memory_summary.json", help="Output JSON path")
+    parser.add_argument("--out",   default="memory.json", help="Output JSON path")
     parser.add_argument("--top-k", type=int, default=None,
                         help="Keep only the N most recent meaningful episodes")
     parser.add_argument("--txt",   action="store_true",
@@ -518,7 +531,7 @@ def main():
         session_files = [Path(f) for f in args.files]
     else:
         session_files = [p for p in Path(args.dir).glob("*.json")
-                         if not p.name.startswith("memory_summary")]
+                         if not p.name.startswith("memory")]
 
     if not session_files:
         print("No session files found.")
@@ -541,17 +554,17 @@ def main():
         txt_path.write_text(to_text(summary), encoding="utf-8")
         print(f"Text summary → {txt_path}")
 
-    s = summary["stats"]
+    s  = summary["stats"]
     ws = summary["world_state"]
+    pose = ws.get("current_pose", {})
     print(f"\nStats: {s['total_episodes']} total episodes | "
           f"{s['meaningful_episodes']} meaningful | "
           f"{s['trivial_episodes_pruned']} trivial pruned")
     print(f"       {s['successful']} success | {s['errors']} errors | "
           f"avg {s['average_duration_s']}s/episode")
-    print(f"World state: arm={ws['arm_pose']} | gripper={ws['gripper']}")
-    if ws.get("stacks"):
-        for i, tower in enumerate(ws["stacks"], 1):
-            print(f"Stack {i} (bottom→top): {' > '.join(tower)}")
+    print(f"Last location: {ws.get('last_location', 'unknown')} | "
+          f"Pose: x={pose.get('x')}, y={pose.get('y')}, yaw={pose.get('yaw_degrees')}°")
+    print(f"Known locations: {', '.join(ws.get('known_locations', [])) or '—'}")
     print("Procedures mined:", ", ".join(summary["procedures"].keys()))
 
 

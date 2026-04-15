@@ -12,8 +12,10 @@ from .agent import build_embodied_agent
 from .utils.nav2_tools import get_tools
 from .utils.utils import format_message, format_response, print_response
 from .utils.episode_recorder import EpisodeRecorder
+from .utils.recovery_advisor import RecoveryAdvisor
 from .utils.memory_summarizer import build_summary
 from .config import get_config
+from .llm import get_qwen_llm  
 from .context import Context
 
 from pathlib import Path
@@ -21,122 +23,24 @@ from pathlib import Path
 EPISODES_DIR = Path("episodes")
 MEMORY_DIR   = Path("memory")
 
-# ---------------------------------------------------------------------------
-# Layer 1: Terminal tools — the tool that must have run for a task to be done
-# ---------------------------------------------------------------------------
-# _REQUIRED_TOOLS = {
-#     "forward":    "move_forward",
-#     "backward":   "move_backward",
-#     "left":       "move_left",
-#     "right":      "move_right",
-#     "turn left":  "turn_left",
-#     "turn right": "turn_right",
-#     "go to":      "navigate_to_location",
-#     "navigate":   "navigate_to_pose",
-#     }
-
-# ---------------------------------------------------------------------------
-# Layer 2: Semantic checks — all nav tools share the same response shape
-# ---------------------------------------------------------------------------
-_CHECKED_TOOLS = {
-    "navigate_to_pose",
-    "navigate_to_location",
-    "move_forward",
-    "move_backward",
-    "move_left",
-    "move_right",
-    "turn_left",
-    "turn_right",
-    "get_current_pose",
-}
-
-def _check_tool_result(tool_name: str, data: dict) -> str | None:
-    if not data.get("success"):
-        reason = data.get("message") or data.get("status") or "unknown error"
-        return f"'{tool_name}' failed: {reason}"
-    return None
-
-# ---------------------------------------------------------------------------
-# Layer 3: Agent verification block — mandated by system prompt
-# ---------------------------------------------------------------------------
-_VERIFICATION_FAILED_RE  = re.compile(r"result\s*:\s*failed",  re.IGNORECASE)
-_VERIFICATION_SUCCESS_RE = re.compile(r"result\s*:\s*success", re.IGNORECASE)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def _parse_tool_result(content) -> dict:
-    try:
-        return json.loads(content) if isinstance(content, str) else (content or {})
-    except (json.JSONDecodeError, TypeError):
-        return {}
-
 
 def _extract_failure(result: dict, query: str) -> str | None:
-    """
-    Return a failure description string if the navigation task did not complete,
-    or None if everything succeeded.
+    structured = result.get("structured_response")
 
-    Layer 1 — Terminal tool check (structural):
-        Did the expected tool for this query run and return success=True?
-        Catches: required tool never called because an earlier step aborted.
+    # DEBUG:
+    print(f"Structured outcome is {structured.outcome}")
+    
+    if structured is None:
+        return None  # no structured output — treat as success
 
-    Layer 2 — Semantic tool check:
-        Did any navigation tool return success=False?
-        Catches: Nav2 action server rejections, odometry failures, unknown locations.
+    if structured.task_type == "query":
+        print(f"Task type {query} detected")
+        return None  # informational, never a failure
 
-    Layer 3 — Agent verification block (template parsing):
-        The system prompt forces "Result: SUCCESS / FAILED" in every response.
-        Catches: all physical outcome failures the agent itself detects,
-                 e.g. robot missed target pose, outside tolerance.
-    """
-    messages    = result.get("messages", [])
-    query_lower = query.lower()
+    if structured.outcome == "failed":
+        return structured.failure_reason or "agent reported failure"
 
-    # --- Layer 1: did the expected terminal tool run and succeed? ---
-    # for keyword, tool_name in _REQUIRED_TOOLS.items():
-    #     if keyword not in query_lower:
-    #         continue
-
-    #     tool_msgs = [
-    #         m for m in messages
-    #         if isinstance(m, ToolMessage) and m.name == tool_name
-    #     ]
-
-    #     if not tool_msgs:
-    #         return f"'{tool_name}' was never executed"
-
-    #     data = _parse_tool_result(tool_msgs[-1].content)
-    #     if not data.get("success"):
-    #         reason = data.get("message") or data.get("status") or "unknown error"
-    #         return f"'{tool_name}' failed: {reason}"
-
-    # --- Layer 2: did any tool return a domain failure? ---
-    for msg in messages:
-        if not isinstance(msg, ToolMessage) or msg.name not in _CHECKED_TOOLS:
-            continue
-        reason = _check_tool_result(msg.name, _parse_tool_result(msg.content))
-        if reason:
-            return reason
-
-    # --- Layer 3: parse the agent's structured verification block ---
-    found_success = False
-    for msg in messages:
-        if not isinstance(msg, AIMessage):
-            continue
-        content = msg.content or ""
-        if not content.strip():
-            continue
-        if _VERIFICATION_FAILED_RE.search(content):
-            return "agent verification block reported Result: FAILED"
-        if _VERIFICATION_SUCCESS_RE.search(content):
-            found_success = True
-
-    if found_success:
-        return None
-
-    return None  # no verification block present — treat as success
+    return None
 
 # ---------------------------------------------------------------------------
 # Agent node
@@ -148,13 +52,24 @@ class Agent(Node):
         qos_profile: QoSProfile = QoSProfile(depth=1, durability=QoSDurabilityPolicy.VOLATILE)
         self.subscription = self.create_subscription(String, "query", self.query_callback, qos_profile=qos_profile)
         tools = get_tools(self)
-
+            
         self.agent = build_embodied_agent(tools=tools)
 
         self.recorder = EpisodeRecorder(save_dir=EPISODES_DIR)
         self.get_logger().info(f"Episode recorder session: {self.recorder.session_id}")
 
-        self.get_logger().info("Agent node initialised!")
+        # Toggle: set to False to disable the RecoveryAdvisor and retry with plain context only
+        self.use_recovery_advisor: bool = False
+
+        self.recovery_advisor = RecoveryAdvisor(
+            recorder=self.recorder,
+            llm=get_qwen_llm(),
+            memory_path=MEMORY_DIR / "memory.json",
+        ) if self.use_recovery_advisor else None
+
+        self.get_logger().info(
+            f"Agent node initialised! (recovery_advisor={'enabled' if self.use_recovery_advisor else 'disabled'})"
+        )
         self.message_recieved: bool = False
 
 
@@ -172,7 +87,7 @@ class Agent(Node):
                          daemon=True).start()
 
 
-    def handle_query(self, user_query: str, max_attempts: int = 3):
+    def handle_query(self, user_query: str, max_attempts: int = 2):
         episode = self.recorder.start_episode(query=user_query)
         invoke_message = format_message(user_query)
         result = None
@@ -192,21 +107,51 @@ class Agent(Node):
                 failure = _extract_failure(result, user_query)
 
                 if failure is None:
-                    self.get_logger().info("Navigation task completed successfully.")
+                    self.get_logger().info("Task completed successfully.")
                     break
 
                 if attempt < max_attempts:
-                    self.get_logger().warning(
-                        f"Attempt {attempt} failed: {failure}. Retrying..."
+                    # Resolve hint only when the advisor is enabled
+                    if self.use_recovery_advisor and self.recovery_advisor is not None:
+                        hint = self.recovery_advisor.get_hint(
+                            failure_reason=failure,
+                            query=user_query,
+                        )
+                    else:
+                        hint = None
+
+                    episode.record_retry(
+                        attempt=attempt,
+                        failure_reason=failure,
+                        hint_used=hint,
                     )
-                    invoke_message = format_message(
-                        f"[RETRY — Attempt {attempt + 1}/{max_attempts}]\n"
-                        f"The previous navigation attempt did not complete.\n"
-                        f"Reason: {failure}\n\n"
-                        f"Call get_current_pose() to re-establish position, "
-                        f"then re-execute the original task:\n"
-                        f"{user_query}"
-                    )
+
+                    if hint:
+                        self.get_logger().warning(
+                            f"Attempt {attempt} failed: {failure}. Retrying with hint: {hint}"
+                        )
+                        retry_body = (
+                            f"[RETRY — Attempt {attempt + 1}/{max_attempts}]\n"
+                            f"The previous attempt did not complete the task. Return to Home pose.\n"
+                            f"Reason: {failure}\n\n"
+                            f"{hint}\n\n"
+                            f"ALWAYS return to home pose first, then re-execute the original task:\n"
+                            f"{user_query}"
+                        )
+                    else:
+                        self.get_logger().warning(
+                            f"Attempt {attempt} failed: {failure}. Retrying without hint."
+                        )
+                        retry_body = (
+                            f"[RETRY — Attempt {attempt + 1}/{max_attempts}]\n"
+                            f"The previous attempt did not complete the task. Return to Home pose.\n"
+                            f"Reason: {failure}\n\n"
+                            f"ALWAYS return to home pose first, then re-execute the original task:\n"
+                            f"{user_query}"
+                        )
+
+                    invoke_message = format_message(retry_body)
+
                 else:
                     self.get_logger().error(
                         f"All {max_attempts} attempts failed. Last failure: {failure}"
@@ -218,7 +163,7 @@ class Agent(Node):
             self.recorder.close_episode_from_formatted_response(
                 episode=episode,
                 formatted=formatted,
-                outcome="success" if _extract_failure(result, user_query) is None else "failed",
+                outcome="success",
             )
             self.get_logger().info(f"Episode saved → {episode.episode_id}")
 
@@ -236,10 +181,6 @@ class Agent(Node):
             self.get_logger().info("Waiting for the next message...\n")
 
     def save_memory(self):
-        """
-        Build and write a compact memory.json from all session files
-        in the episodes directory. Called once on shutdown.
-        """
         session_files = [
             p for p in EPISODES_DIR.glob("*.json")
             if not p.name.startswith("memory")
@@ -251,6 +192,12 @@ class Agent(Node):
 
         try:
             summary = build_summary(session_files)
+
+            # build_summary returns {} when all session files are empty
+            if not summary:
+                self.get_logger().info("No episodes recorded this session, skipping memory save.")
+                return
+
             MEMORY_DIR.mkdir(parents=True, exist_ok=True)
             out_path = MEMORY_DIR / "memory.json"
             with open(out_path, "w", encoding="utf-8") as f:

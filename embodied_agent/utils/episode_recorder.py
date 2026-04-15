@@ -76,7 +76,17 @@ class Episode:
         self.final_response: Optional[str] = None
         self.outcome: str = "unknown"   # "success" | "error" | "unknown"
         self.error: Optional[str] = None
-
+        self.retries: list[dict] = []
+        
+    def record_retry(self, attempt: int, failure_reason: str, hint_used: str):
+        """Called before each retry attempt to track what was tried."""
+        self.retries["count"] = attempt
+        self.retries["attempts"].append({
+            "attempt": attempt,
+            "failure_reason": failure_reason,
+            "hint_used": hint_used,
+        })
+        
     def add_tool_call(self, tool: str, args: dict, output: str, tool_call_id: str):
         step = len(self.tool_calls) + 1
         self.tool_calls.append(ToolCallRecord(step, tool, args, output, tool_call_id))
@@ -97,6 +107,7 @@ class Episode:
             "timestamp_end": self.timestamp_end,
             "duration_s": self.duration_s,
             "query": self.query,
+            "retries": self.retries,
             "tool_calls": [tc.to_dict() for tc in self.tool_calls],
             "final_response": self.final_response,
             "outcome": self.outcome,
@@ -137,7 +148,6 @@ class EpisodeRecorder:
         self._filepath = self.save_dir / f"{self.session_id}.json"
         self._init_file()
 
-    # ── Public API ────────────────────────────────────────────────────────────
 
     def start_episode(self, query: str) -> Episode:
         """Open a new episode for the given user query."""

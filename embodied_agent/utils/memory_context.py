@@ -1,53 +1,58 @@
 """
-memory_context.py
------------------
-Uses Qwen (via OpenRouter) to read the full memory_summary.json and produce
-a compact, agent-ready context string covering:
+memory_context.py  (navigation stack)
+--------------------------------------
+Reads memory.json and produces a compact, agent-ready context string covering:
 
-  - Current robot state  (arm pose, gripper, known objects, stack)
-  - User preferences     (favorite color, name, anything stated)
-  - Previous tasks       (what was done, outcomes, retry patterns)
+  - Current robot state  (pose, last known location)
+  - Known locations      (all waypoints the robot has visited or saved)
+  - Previous tasks       (what was done, outcomes, any failures)
   - Learned behaviours   (which tool sequences work, average durations)
-  - Any other useful facts the LLM deems relevant
+  - Failure risk signals (tasks/conditions with elevated failure probability)
 
 The output is a short prose block (~200-400 tokens) injected directly into
-the agent's system prompt.  Because Qwen decides what's relevant, the block
-stays useful as memory grows — it won't bloat with irrelevant history.
+the agent's system prompt.  Because the LLM decides what's relevant, the block
+stays useful as memory grows.
 
 Usage
 -----
     from .memory_context import build_memory_context
 
-    context_block = build_memory_context("memory_summary.json")
+    context_block = build_memory_context("memory.json")
     system_prompt = get_prompts() + context_block
 """
 
 import json
+from collections import defaultdict
 from pathlib import Path
 from langchain_core.messages import HumanMessage, SystemMessage
 
 
 # ── Prompt templates ───────────────────────────────────────────────────────────
 
-# Maximum words Qwen is allowed to produce — controls injected prompt size.
-# Raise this if you find the context too sparse; lower it to save tokens.
-MAX_CONTEXT_WORDS = 300
+MAX_CONTEXT_WORDS = 350
 
-_SYSTEM_PROMPT = f"""You are a memory distillation assistant for an embodied robot agent.
+_SYSTEM_PROMPT = f"""You are a memory distillation assistant for a wheeled indoor navigation robot agent.
 Your job is to read a structured memory file and produce a compact, useful context block
 that will be prepended to the robot agent's system prompt.
 
 Rules:
-- HARD LIMIT: {MAX_CONTEXT_WORDS} words maximum. Be ruthlessly concise. Cut anything not directly useful for the next task.
+- HARD LIMIT: {MAX_CONTEXT_WORDS} words maximum. Be ruthlessly concise.
 - Use clear sections with short headers.
 - Only include facts that are actually present in the memory — never invent or assume.
-- Prioritise: current physical state > user preferences > recent task outcomes > learned patterns.
-- Skip sections that have no data (e.g. omit "Robot State" if arm_pose is unknown).
-- If an archived_summary exists, treat it as a condensed history — do not expand it.
+- Prioritise: current pose > last location > known locations > failure risks > recent task outcomes > learned patterns.
+- Skip sections that have no data (e.g. omit "Current Pose" if pose is unknown).
+- If an archived_summary exists, treat it as condensed history — do not expand it.
 - Write in a factual, direct tone suitable for an agent system prompt.
-- Do NOT include meta-commentary like "the memory shows..." — just state the facts directly."""
+- Do NOT include meta-commentary like "the memory shows..." — just state the facts directly.
 
-_USER_PROMPT_TEMPLATE = """Here is the robot agent's memory file. Extract and summarise the most
+For the Failure Risk section:
+- A task type is HIGH RISK if its failure_rate exceeds 0.4 OR it has required 2+ retries in any episode.
+- A task type is MEDIUM RISK if its failure_rate is between 0.2–0.4 OR it has a known fragile precondition.
+- Only list LOW RISK tasks if they share a tool with a HIGH/MEDIUM risk task.
+- For each risk entry state: the task type, the observed failure rate or retry count, and the most
+  likely root cause if it can be inferred from the episode outcomes."""
+
+_USER_PROMPT_TEMPLATE = """Here is the navigation robot agent's memory file. Extract and summarise the most
 relevant context for the agent's next session.
 
 MEMORY FILE:
@@ -56,34 +61,42 @@ MEMORY FILE:
 Produce a context block with these sections (omit any section with no data):
 
 ## Current Robot State
-(arm pose, gripper state, known objects, stack configuration)
+(current pose x/y/yaw, last known location name)
+
+## Known Locations
+List all location names the robot has successfully navigated to or saved.
+These are valid navigation targets.
+
+## Failure Risk Signals
+CRITICAL — read this before planning any task.
+List task types ordered from highest to lowest failure risk. For each entry include:
+- Risk level: HIGH / MEDIUM / LOW
+- Task type name
+- Failure rate or retry pattern (e.g. "failed 1/3 attempts")
+- Most likely cause (e.g. "goal tolerance too tight near Table D", "yaw drift on long runs")
+If no failures or retries exist in memory, write: "No failure patterns recorded yet."
 
 ## User Preferences & Facts
-(anything the user has told the agent about themselves)
+(anything the user has stated about their preferences, critical tasks, or repeat patterns)
 
 ## Previous Tasks
-(what tasks were performed, outcomes, any retries needed — last 3-5 most relevant)
-
-## Learned Behaviours
-(which tool sequences work well, typical durations, anything worth knowing for future tasks)
+(last 3-5 most relevant navigation tasks and their outcomes)
 
 Write only the context block, nothing else."""
 
 
-# ── Main function ──────────────────────────────────────────────────────────────
-
 def build_memory_context(
-    summary_path: str | Path = "memory_summary.json",
+    summary_path: str | Path = "memory.json",
     llm=None,
     fallback_to_manual: bool = True,
 ) -> str:
     """
-    Read memory_summary.json and return a compact context string for the agent.
+    Read memory.json and return a compact context string for the agent.
 
     Parameters
     ----------
-    summary_path       : path to memory_summary.json (from memory_summarizer.py)
-    llm                : a LangChain chat model — pass get_qwen_llm() here.
+    summary_path       : path to memory.json (from memory_summarizer.py)
+    llm                : a LangChain chat model.
                          If None, falls back to manual formatting.
     fallback_to_manual : if True and the LLM call fails, fall back to manual
                          formatting instead of raising an exception.
@@ -107,22 +120,15 @@ def build_memory_context(
     return _llm_format(summary, llm, fallback_to_manual)
 
 
-# How many recent episodes to send to Qwen.
-# world_state + user_facts + procedures are always sent in full.
-# Archived summary (if present) replaces older episodes so this window
-# only needs to cover genuinely recent activity.
-EPISODE_WINDOW = 15
+EPISODE_WINDOW = 10
 
 
 def _llm_format(summary: dict, llm, fallback: bool) -> str:
-    """Send memory JSON to Qwen with an episode window and return the distilled context block."""
-
-    # Always send world_state, user_facts, procedures, archived_summary in full.
-    # Cap recent_episodes to the last EPISODE_WINDOW entries — older history is
-    # already represented by archived_summary once compression has run.
+    """Send memory JSON to the LLM and return the distilled context block."""
     payload = {
         **{k: v for k, v in summary.items() if k != "recent_episodes"},
         "recent_episodes": summary.get("recent_episodes", [])[-EPISODE_WINDOW:],
+        "_failure_stats":  _compute_failure_stats(summary.get("recent_episodes", [])),
     }
     memory_json_str = json.dumps(payload, indent=2, ensure_ascii=False)
 
@@ -132,15 +138,13 @@ def _llm_format(summary: dict, llm, fallback: bool) -> str:
     ]
 
     try:
-        # Pass max_tokens so the API hard-stops output at our word budget.
-        # ~1.3 tokens/word is a safe estimate for English prose.
-        response = llm.invoke(messages, max_tokens=int(MAX_CONTEXT_WORDS * 1.4))
-        context  = response.content.strip()
+        response  = llm.invoke(messages, max_tokens=int(MAX_CONTEXT_WORDS * 1.4))
+        context   = response.content.strip()
         word_count = len(context.split())
         if word_count >= MAX_CONTEXT_WORDS * 0.95:
-            print(f"[memory_context] WARNING: output near limit ({word_count}/{MAX_CONTEXT_WORDS} words) — consider raising MAX_CONTEXT_WORDS or running --compress")
+            print(f"[memory_context] WARNING: output near limit ({word_count}/{MAX_CONTEXT_WORDS} words)")
         else:
-            print(f"[memory_context] Qwen distilled memory → {word_count} words")
+            print(f"[memory_context] Memory distilled: {word_count} words")
             print(context)
         return f"\n\n{context}\n"
 
@@ -152,10 +156,68 @@ def _llm_format(summary: dict, llm, fallback: bool) -> str:
         raise
 
 
+RISK_HIGH_FAILURE_RATE      = 0.40
+RISK_MEDIUM_FAILURE_RATE    = 0.20
+RISK_HIGH_RETRY_THRESHOLD   = 2
+RISK_MEDIUM_RETRY_THRESHOLD = 1
+
+
+def _compute_failure_stats(episodes: list[dict]) -> dict:
+    """
+    Aggregate per-task-type failure statistics from the episode list.
+    """
+    stats: dict[str, dict] = defaultdict(lambda: {
+        "attempts":      0,
+        "failures":      0,
+        "max_retries":   0,
+        "total_retries": 0,
+        "failure_causes": [],
+    })
+
+    for ep in episodes:
+        task = ep.get("task_type", "other")
+        if task == "other":
+            continue
+
+        s = stats[task]
+        s["attempts"] += 1
+
+        retries = ep.get("key_args", {}).get("retries", 0)
+        s["total_retries"] += retries
+        s["max_retries"]    = max(s["max_retries"], retries)
+
+        if ep.get("outcome") != "success":
+            s["failures"] += 1
+            cause = ep.get("outcome_fact", "").strip()
+            if cause and cause not in s["failure_causes"]:
+                s["failure_causes"].append(cause)
+        elif retries > 0:
+            cause = ep.get("outcome_fact", "").strip()
+            if cause and cause not in s["failure_causes"]:
+                s["failure_causes"].append(f"[recovered] {cause}")
+
+    result = {}
+    for task, s in stats.items():
+        rate = s["failures"] / s["attempts"] if s["attempts"] else 0.0
+        s["failure_rate"] = round(rate, 3)
+
+        if rate >= RISK_HIGH_FAILURE_RATE or s["max_retries"] >= RISK_HIGH_RETRY_THRESHOLD:
+            risk = "HIGH"
+        elif rate >= RISK_MEDIUM_FAILURE_RATE or s["max_retries"] >= RISK_MEDIUM_RETRY_THRESHOLD:
+            risk = "MEDIUM"
+        else:
+            risk = "LOW"
+        s["risk_level"] = risk
+        result[task] = s
+
+    return result
+
+
+
 def _manual_format(summary: dict) -> str:
     """
     Fallback: manually format the memory summary into a prompt block.
-    No LLM required — used when Qwen is unavailable.
+    No LLM required — used when the model is unavailable.
     """
     ws    = summary.get("world_state", {})
     procs = summary.get("procedures", {})
@@ -164,42 +226,61 @@ def _manual_format(summary: dict) -> str:
 
     lines = ["\n\n## Robot Memory\n"]
 
-    # ── Robot state ───────────────────────────────────────────────────────────
-    has_state = (ws.get("arm_pose") not in (None, "unknown")
-                 or ws.get("gripper") not in (None, "unknown")
-                 or ws.get("known_objects")
-                 or ws.get("stack"))
+    pose      = ws.get("current_pose", {})
+    last_loc  = ws.get("last_location")
+    known_locs = ws.get("known_locations", [])
 
-    if has_state:
+    has_pose = pose.get("x") is not None
+    if has_pose or last_loc:
         lines.append("### Current Robot State")
-        if ws.get("arm_pose") not in (None, "unknown"):
-            lines.append(f"- Arm: {ws['arm_pose']}")
-        if ws.get("gripper") not in (None, "unknown"):
-            lines.append(f"- Gripper: {ws['gripper']}")
-        if ws.get("known_objects"):
-            lines.append(f"- Known objects: {', '.join(ws['known_objects'])}")
-        for i, tower in enumerate(ws.get("stacks", []), 1):
-            label = f"Stack {i}" if len(ws.get("stacks", [])) > 1 else "Stack"
-            lines.append(f"- {label} (bottom→top): {' > '.join(tower)}")
+        if has_pose:
+            lines.append(
+                f"- Pose: x={pose['x']:.3f} m, y={pose['y']:.3f} m, "
+                f"yaw={pose['yaw_degrees']:.1f}°"
+            )
+        if last_loc:
+            lines.append(f"- Last known location: {last_loc}")
 
-    # ── User preferences ──────────────────────────────────────────────────────
+    if known_locs:
+        lines.append("\n### Known Locations")
+        lines.append(f"- {', '.join(known_locs)}")
+
+    all_eps    = summary.get("recent_episodes", [])
+    fail_stats = _compute_failure_stats(all_eps)
+
+    risk_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    risky = sorted(
+        [(t, s) for t, s in fail_stats.items() if s["risk_level"] != "LOW"],
+        key=lambda x: risk_order[x[1]["risk_level"]],
+    )
+
+    lines.append("\n### Failure Risk Signals")
+    if not risky:
+        lines.append("- No failure patterns recorded yet.")
+    else:
+        for task, s in risky:
+            rate_pct  = f"{s['failure_rate']*100:.0f}%"
+            retry_str = (f", max {s['max_retries']} retr{'ies' if s['max_retries'] != 1 else 'y'}/episode"
+                         if s["max_retries"] > 0 else "")
+            cause_str = f" — {s['failure_causes'][-1]}" if s["failure_causes"] else ""
+            lines.append(
+                f"- [{s['risk_level']}] {task}: "
+                f"{s['failures']}/{s['attempts']} failed ({rate_pct}){retry_str}{cause_str}"
+            )
+
     if uf:
         lines.append("\n### User Preferences & Facts")
         for key, value in uf.items():
             label = key.replace("_", " ").capitalize()
             lines.append(f"- {label}: {value}")
 
-    # ── Previous tasks ────────────────────────────────────────────────────────
-    meaningful_eps = [e for e in eps if e.get("task_type") != "other"]
+    meaningful_eps = [e for e in eps if e.get("task_type") not in ("other", "query_pose", "query_locations")]
     if meaningful_eps:
         lines.append("\n### Previous Tasks")
         for ep in meaningful_eps:
-            retries = ep.get("key_args", {}).get("retries", 0)
-            retry_s = f" ({retries} retr{'ies' if retries != 1 else 'y'})" if retries else ""
-            status  = "✓" if ep["outcome"] == "success" else "✗"
-            lines.append(f"- {status}{retry_s} [{ep['task_type']}] {ep['outcome_fact']}")
+            status = "✓" if ep["outcome"] == "success" else "✗"
+            lines.append(f"- {status} [{ep['task_type']}] {ep['outcome_fact']}")
 
-    # ── Learned behaviours ────────────────────────────────────────────────────
     real_procs = {k: v for k, v in procs.items() if k != "other" and v.get("tool_sequence")}
     if real_procs:
         lines.append("\n### Learned Behaviours")
@@ -208,4 +289,4 @@ def _manual_format(summary: dict) -> str:
             dur = f"~{proc['avg_duration_s']}s" if proc.get("avg_duration_s") else ""
             lines.append(f"- {task} ({dur}): {seq}")
 
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines)
