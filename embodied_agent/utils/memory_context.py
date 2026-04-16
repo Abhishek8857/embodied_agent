@@ -21,7 +21,7 @@ Usage
     context_block = build_memory_context("memory_summary.json")
     system_prompt = get_prompts() + context_block
 """
-
+import time
 import json
 from collections import defaultdict
 from pathlib import Path
@@ -160,14 +160,19 @@ def _llm_format(summary: dict, llm, fallback: bool) -> str:
     try:
         # Pass max_tokens so the API hard-stops output at our word budget.
         # ~1.3 tokens/word is a safe estimate for English prose.
+        start_time = time.time()
         response = llm.invoke(messages, max_tokens=int(MAX_CONTEXT_WORDS * 1.4))
         context  = response.content.strip()
         word_count = len(context.split())
         if word_count >= MAX_CONTEXT_WORDS * 0.95:
             print(f"[memory_context] WARNING: output near limit ({word_count}/{MAX_CONTEXT_WORDS} words) — consider raising MAX_CONTEXT_WORDS or running --compress")
         else:
-            print(f"[memory_context] Qwen distilled memory: {word_count} words")
+            print(f"[memory_context] Mistral distilled memory: {word_count} words")
             print(context)
+    
+            print(f"\nTokens Used: {response.response_metadata['token_usage']['total_tokens']}")
+            print(f"\nCost for distillation: {response.response_metadata['token_usage']['cost']}")
+            print(f"\nTime for Distillation: {time.time() - start_time}\n")
         return f"\n\n{context}\n"
 
     except Exception as e:

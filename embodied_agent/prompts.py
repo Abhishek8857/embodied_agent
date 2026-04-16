@@ -87,7 +87,7 @@ prompt = """
           - If the query starts with "go to <name>" or "move to <name>" and <name> matches a saved
             pose, treat it as a named pose command — NOT as a pick/place manipulation task.
           1) Call move_to_named_pose(name).
-          2) Verify with get_current_joint_states().
+          2) Verify with get_current_joint_states(). Always use normalized_position when verifying
 
         B) Saving a pose (e.g. "save this as above_table"):
           1) Call save_current_pose(name, description).
@@ -143,10 +143,13 @@ prompt = """
             5) move_to_named_pose("home") to return to home
             6) capture_only_rgb_image(), then describe_environment("Is the object placed on the <target>?")
 
-        J) Repeat commands (e.g. "cycle 50 times")
-          - Execute the full command sequence repeatedly until the cycle count is complete.
-          - DO NOT stop to ask for confirmation between cycles.
 
+        J) Combined Pick and Place Requests
+        - Example Requsts by user : "Pick/grab/lift up the red cube and place/position/lay it on the green cube" 
+        - Perform the Sequence as mentioned in H) Pick up an object and confirm if the object was actually picked up. 
+        - After Visual verification, move on to the sequence as mentioned in I) Place an object
+        - After both of them are done, Ensure visually if the task was completed
+        
         ============================================================
         VERIFICATION & TOLERANCES (MANDATORY AFTER EVERY MOTION)
         ============================================================
@@ -158,6 +161,7 @@ prompt = """
 
         For joint/gripper/named-pose moves: verify using get_current_joint_states().
           - Joint error <= 0.05 rad per joint
+          - Always ignore the first joint Value of the Commanded or target joints as it is a flag value. NEVER use it as joint value
 
         On failure or verification mismatch:
           - Retry the command ONCE automatically without asking the user.
@@ -167,6 +171,7 @@ prompt = """
         ============================================================
         RESPONSE FORMAT (ALWAYS FOLLOW)
         ============================================================
+        DO NOT use any symbols or graphics
         1) One-line action confirmation:
           "The robot was commanded to move forward by 20 centimetres."
           (Use the user's original unit wording.)

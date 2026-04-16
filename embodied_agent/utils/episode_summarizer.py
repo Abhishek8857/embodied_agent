@@ -115,7 +115,7 @@ _SHAPE_SYNONYMS: dict[str, str] = {
 }
 
 # Regex that matches any label containing "nvidia" or a verbose description of
-# the NVIDIA box (e.g. "black rectangular box with the nvidia logo …").
+# the NVIDIA box (e.g. "black rectangular box with the NVIDIA logo …").
 _NVIDIA_ALIAS_RE = re.compile(
     r"nvidia|black\s+rectangular\s+box",
     re.IGNORECASE,
@@ -702,7 +702,8 @@ def derive_world_state(episodes: list[dict]) -> dict:
         if not state["last_updated"]:
             state["last_updated"] = ep.get("time", "")
 
-        t = ep.get("task_type")
+        t     = ep.get("task_type")
+        tools = ep.get("tools", [])
 
         if state["arm_pose"] == "unknown":
             if t == "home" and ep["outcome"] == "success":
@@ -716,14 +717,18 @@ def derive_world_state(episodes: list[dict]) -> dict:
                 state["arm_pose"] = "custom"
 
         if state["gripper"] == "unknown":
-            if t == "open_gripper" and ep["outcome"] == "success":
-                state["gripper"] = "open"
-            elif t == "close_gripper" and ep["outcome"] == "success":
-                state["gripper"] = "closed"
-            elif t == "pick_and_place" and ep["outcome"] == "success":
-                state["gripper"] = "open"
-            elif t == "pick_only" and ep["outcome"] == "success":
-                state["gripper"] = "closed"
+            # FIX: check actual tool calls first — this correctly handles compound
+            # queries like "go home and open gripper" where task_type is "home"
+            # (first pattern match wins) but open_the_gripper was still executed.
+            if ep["outcome"] == "success":
+                if "open_the_gripper" in tools:
+                    state["gripper"] = "open"
+                elif "close_the_gripper" in tools:
+                    state["gripper"] = "closed"
+                elif t == "pick_and_place":
+                    state["gripper"] = "open"
+                elif t == "pick_only":
+                    state["gripper"] = "closed"
 
         if state["arm_pose"] != "unknown" and state["gripper"] != "unknown":
             break

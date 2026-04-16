@@ -1,3 +1,4 @@
+import math
 import threading
 import time
 
@@ -7,10 +8,9 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
 
-
-
 class JointStateCache:
     """Subscribes to a JointState topic and keeps the latest message."""
+
     def __init__(self, node, topic: str = "/joint_states", qos: Optional[QoSProfile] = None):
         self.topic = topic
         self._lock = threading.Lock()
@@ -38,6 +38,11 @@ class JointStateCache:
             self._last_msg = msg
             self._last_time = time.time()
 
+    @staticmethod
+    def _wrap(a: float) -> float:
+        """Wrap a single angle to [−π, +π]."""
+        return (a + math.pi) % (2 * math.pi) - math.pi
+
     def get_latest(self, max_age_s: float = 1.0) -> Dict[str, Any]:
         with self._lock:
             msg = self._last_msg
@@ -57,13 +62,18 @@ class JointStateCache:
                 "error_description": f"Latest '{self.topic}' is stale (age={age:.3f}s > {max_age_s}s).",
             }
 
+        positions = list(msg.position)
+
         return {
             "success": True,
             "age_s": float(age),
             "name": list(msg.name),
-            "position": list(msg.position),
+            # Raw Isaac frame — unbounded, used by the bridge for shift alignment.
+            "position": positions,
+            # Wrapped to [−π, +π] — same frame MoveIt uses.
+            # ALWAYS use this field when comparing against a commanded pose.
+            # +3.1217 and −3.1622 are the same physical position (differ by 2π).
+            "normalized_position": [self._wrap(p) for p in positions],
             "velocity": list(msg.velocity) if msg.velocity else [],
             "effort": list(msg.effort) if msg.effort else [],
-        }       
-        
-        
+        }

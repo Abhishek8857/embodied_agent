@@ -146,7 +146,8 @@ class Agent(Node):
                             f"[RETRY — Attempt {attempt + 1}/{max_attempts}]\n"
                             f"The previous attempt did not complete the task. Return to Home pose.\n"
                             f"Reason: {failure}\n\n"
-                            f"ALWAYS return to home pose first, then re-execute the original task:\n"
+                            f"ALWAYS return to home pose first, then determine which part of the task has failed and continue from there."
+                            f"In case of complete failure, re-execute the original task with fresh perception and segmentation of the objects to be handled if required :\n"
                             f"{user_query}"
                         )
 
