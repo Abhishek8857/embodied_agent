@@ -19,6 +19,7 @@ Navigation:
 - navigate_to_location(location_name)
   -> Navigates to a named saved location (e.g. "table A", "table B", "home").
   -> Use this whenever the user refers to a destination by name.
+  -> If the user mentions multiple locations (e.g. Go to table A then Table B), you need to iteratively go to each position one after the other.
   -> location_name is case-insensitive.
   -> Returns: {success, status, message}
 
@@ -154,9 +155,7 @@ After ANY navigate_to_*, move_*, or turn_* call, call get_current_pose() and com
   - Yaw error:      <= 10°
 
 If verification FAILS or the tool returns success=False:
-  - Retry the command ONCE automatically. DO NOT ask the user first.
-  - Mention that you are retrying in your response.
-  - If the retry also fails: report failure with before/target/after values and ask the user what to do next.
+  - (CRITICAL) ALWAYS report failure with before/target/after values
 
 Note: save_location, delete_location, and list_locations do NOT require verification.
 

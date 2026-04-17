@@ -12,6 +12,7 @@ from .agent import build_embodied_agent
 from .utils.nav2_tools import get_tools
 from .utils.utils import format_message, format_response, print_response
 from .utils.episode_recorder import EpisodeRecorder
+from .utils.utils import _build_retry_query
 from .utils.recovery_advisor import RecoveryAdvisor
 from .utils.memory_summarizer import build_summary
 from .config import get_config
@@ -29,7 +30,8 @@ def _extract_failure(result: dict, query: str) -> str | None:
 
     # DEBUG:
     print(f"Structured outcome is {structured.outcome}")
-    
+    # print("TYPE structured_response:", type(structured))
+    # print("VALUE structured_response:", structured)
     if structured is None:
         return None  # no structured output — treat as success
 
@@ -138,19 +140,32 @@ class Agent(Node):
                             f"ALWAYS return to home pose first, then re-execute the original task:\n"
                             f"{user_query}"
                         )
+
+                        # Inside the `if attempt < max_attempts:` block, replace the else branch:
                     else:
                         self.get_logger().warning(
                             f"Attempt {attempt} failed: {failure}. Retrying without hint."
                         )
+
+                        structured = result.get("structured_response") if result else None
+                        adjusted_query = _build_retry_query(user_query, structured)
+
+                        if adjusted_query != user_query:
+                            self.get_logger().info(
+                                f"Adjusted retry query (remaining distance): '{adjusted_query}'"
+                            )
+
                         retry_body = (
                             f"[RETRY — Attempt {attempt + 1}/{max_attempts}]\n"
-                            f"The previous attempt did not complete the task. Return to Home pose.\n"
+                            f"The previous attempt did not complete the task.\n"
                             f"Reason: {failure}\n\n"
-                            f"ALWAYS return to home pose first, then re-execute the original task:\n"
-                            f"{user_query}"
+                            f"Do NOT restart from zero. Execute only what remains:\n"
+                            f"{adjusted_query}"
                         )
 
+
                     invoke_message = format_message(retry_body)
+                    # self.get_logger().info(f"Retry invoke_message type: {type(invoke_message)}, value: {invoke_message}")
 
                 else:
                     self.get_logger().error(

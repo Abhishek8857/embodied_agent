@@ -23,6 +23,8 @@ class ResponseFormat(BaseModel):
     task_type: Literal["action", "query"] = "query"
     outcome: Literal["success", "failed"] = "success"
     failure_reason: str | None = None
+    distance_traveled: float | None = None 
+
 
     class Config:
         extra = "forbid"

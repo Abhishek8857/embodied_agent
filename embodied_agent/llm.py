@@ -6,7 +6,7 @@ from .utils.utils import get_openai_api_key, get_mistral_api_key
 
 temperature: float = 0.8
 model: str = "gpt-5.1"
-qwen_model = "qwen/qwen3-vl-30b-a3b-thinking"
+qwen_model = "mistralai/mistral-small-2603"
 base_url: str =  "https://openrouter.ai/api/v1"
 
 

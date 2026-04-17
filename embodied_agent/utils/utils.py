@@ -5,6 +5,7 @@ import rclpy
 import tf2_ros
 import threading
 import time
+import re
 
 from typing import Dict, Optional, Any
 from rclpy.duration import Duration
@@ -39,7 +40,13 @@ def format_response(msg: dict) -> dict:
     Returns:
         dict: Formatted response in a dictionary format with human_messages, ai_messages, final_response as keys.
     """
-    data = msg["messages"]
+    if isinstance(msg, dict):
+        data = msg.get("messages", [])
+    elif isinstance(msg, list):
+        data = msg
+    else:
+        raise TypeError(f"Unexpected msg type: {type(msg)}") 
+       
     human_messages, ai_messages, tool_calls, final_response = [], [], [], []
 
     for obj in data:
@@ -118,6 +125,44 @@ def print_response(data: dict):
         except (json.JSONDecodeError, TypeError):
             print(final["content"])
         print()
+
+
+def _build_retry_query(original_query: str, structured_response) -> str:
+    """
+    For relative motion tasks, subtract already-traveled distance so the
+    agent moves only what remains. Falls back to the original query if we
+    can't determine progress.
+    """
+    if structured_response is None:
+        return original_query
+
+    target = _parse_target_distance(original_query)
+    traveled = getattr(structured_response, "distance_traveled", None)
+
+    if target is not None and traveled is not None and traveled >= 0:
+        remaining = round(target - traveled, 4)
+        remaining = max(remaining, 0.0)
+
+        if remaining <= 0:
+            return original_query  # nothing left to do
+
+        # Replace the distance in the original query string
+        corrected = re.sub(
+            r'(\d+(?:\.\d+)?)\s*(?:meter|metre|m)\b',
+            f"{remaining} meters",
+            original_query,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        return corrected
+
+    return original_query 
+
+def _parse_target_distance(query: str) -> float | None:
+    """Extract requested distance (metres) from a relative motion query."""
+    match = re.search(r'(\d+(?:\.\d+)?)\s*(?:meter|metre|m)\b', query, re.IGNORECASE)
+    return float(match.group(1)) if match else None
+
 
 def quat_to_rpy(x: float, y: float, z: float, w: float):
     sinr_cosp = 2.0 * (w * x + y * z)

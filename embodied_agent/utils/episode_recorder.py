@@ -78,10 +78,8 @@ class Episode:
         self.error: Optional[str] = None
         self.retries: list[dict] = []
         
-    def record_retry(self, attempt: int, failure_reason: str, hint_used: str):
-        """Called before each retry attempt to track what was tried."""
-        self.retries["count"] = attempt
-        self.retries["attempts"].append({
+    def record_retry(self, attempt: int, failure_reason: str, hint_used: Optional[str]):
+        self.retries.append({
             "attempt": attempt,
             "failure_reason": failure_reason,
             "hint_used": hint_used,

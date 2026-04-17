@@ -128,11 +128,6 @@ prompt = """
         Tolerance defaults:
         - Joint error <= 0.02 rad per joint (unless you have better robot-specific values)
 
-        If the result is FAILED or if the verification fails FOR ANY REASON:
-        - Retry the User query AGAIN ONE TIME and verify if succeeded. DO NOT ASK OR WAIT FOR USER INPUT and execute the query again automatically
-        - When a command is retried, you MUST mention the command you retried in your response.
-        - If it fails again: report failure, include before/target/after, and ask user what to do next.
-
         ============================================================
         RESPONSE FORMAT (ALWAYS INCLUDE)
         ============================================================

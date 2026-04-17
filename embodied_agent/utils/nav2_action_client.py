@@ -57,12 +57,12 @@ class Nav2ActionClient(Node):
         }
 
     def navigate_to_pose(
-        self,
-        x: float,
-        y: float,
-        yaw_degrees: float = 0.0,
-        frame_id: str = "map",
-        timeout_sec: float = 60.0,
+    self,
+    x: float,
+    y: float,
+    yaw_degrees: float = 0.0,
+    frame_id: str = "map",
+    timeout_sec: float = 45.0,
     ) -> dict:
         if not self._client.wait_for_server(timeout_sec=5.0):
             return {
@@ -83,11 +83,29 @@ class Nav2ActionClient(Node):
         goal.pose.pose.orientation.w = math.cos(yaw_rad / 2.0)
 
         self.get_logger().info(f"[Agent] navigate_to_pose → x={x}, y={y}, yaw={yaw_degrees}°")
-        result = self._client.send_goal(goal)
 
-        if result is None:
+        # Send goal asynchronously and wait with timeout
+        send_goal_future = self._client.send_goal_async(goal)
+        if not self._wait_for_future(send_goal_future, timeout_sec=10.0):
+            return {"success": False, "status": "timeout", "message": "Timed out waiting for goal acceptance"}
+
+        goal_handle = send_goal_future.result()
+        if not goal_handle.accepted:
             return {"success": False, "status": "rejected", "message": "Goal rejected by action server"}
 
+        # Wait for result with the main timeout
+        result_future = goal_handle.get_result_async()
+        if not self._wait_for_future(result_future, timeout_sec=timeout_sec):
+            # Cancel the goal so the robot doesn't keep trying
+            self.get_logger().warning(f"[Agent] Navigation timed out after {timeout_sec}s — cancelling goal")
+            goal_handle.cancel_goal_async()
+            return {
+                "success": False,
+                "status": "timeout",
+                "message": f"Navigation timed out after {timeout_sec}s",
+            }
+
+        result = result_future.result()
         status_map = {
             GoalStatus.STATUS_SUCCEEDED: ("succeeded", True),
             GoalStatus.STATUS_ABORTED:   ("aborted",   False),
@@ -100,6 +118,17 @@ class Nav2ActionClient(Node):
         )
         return {"success": success, "status": status_str, "message": message}
 
+
+    def _wait_for_future(self, future, timeout_sec: float) -> bool:
+        """Spin until the future completes or timeout is reached. Returns True if completed."""
+        import time
+        start = time.time()
+        while not future.done():
+            if time.time() - start > timeout_sec:
+                return False
+            time.sleep(0.05)
+        return True
+    
     def cancel_navigation(self) -> dict:
         self._client._cancel_goal()
         return {"success": True, "status": "canceled", "message": "Navigation canceled"}
