@@ -165,7 +165,7 @@ def publish_to(type_name, topic_name: str, coordinates: list = None, msg: bool =
         publisher_node.destroy_node()
     
 
-def get_openai_api_key() -> str: 
+def get_openrouter_api_key() -> str: 
     """
     Returns the OpenAI API key to connect with the Open Router server
 
@@ -176,10 +176,10 @@ def get_openai_api_key() -> str:
         str: API Key
     """
     try:
-        with open("openai_api_key.config", "r") as f:
+        with open("openrouter_api_key.config", "r") as f:
             api_key = os.environ["OPENAI_API_KEY"] = f.read().strip()
     except FileNotFoundError:
-        raise RuntimeError("Missing openai_api_key.config file")
+        raise RuntimeError("Missing openrouter_api_key.config file")
     
     return api_key
 
@@ -220,20 +220,3 @@ def get_gemini_api_key() -> str:
         raise RuntimeError("Missing gemini_api_key.config file")
     
     return api_key
-
-def get_mistral_api_key():
-    """
-    Returns Mistral API Key required to invoke Mistral and other related models for agent 
-
-    Raises:
-        RuntimeError: FileNotFoundError (api config file is missing)
-        
-    Returns:
-        str: API Key
-    """
-    
-    try:
-        with open("mistral_api_key.config", "r") as f:
-            api_key = os.environ["CHATAI_API_KEY"] = f.read.strip()
-    except FileNotFoundError:
-        raise RuntimeError("Missing mistral_api_key.config file")

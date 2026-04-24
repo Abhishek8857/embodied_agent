@@ -26,6 +26,9 @@ def get_tools(node):
     _state = {
         "last_segmentation": None,
     }
+    
+    
+    
 
     # ── Pose registry tools ────────────────────────────────────────────────────
 
@@ -200,17 +203,28 @@ def get_tools(node):
         data = [4.0, x, y, z, qx, qy, qz, qw, retreat_distance]
         return motion.send(data)
 
-    @tool(name_or_callable="save_segmentation_for_graspnet",
-          description="Save segmentation results in Contact-GraspNet format. "
-                      "Call this after segment_objects, then run Contact-GraspNet externally.")
+    @tool(
+        name_or_callable="save_segmentation_for_graspnet",
+        description="Save segmentation results in Contact-GraspNet format. "
+                    "Call this after segment_objects, then run Contact-GraspNet externally."
+    )
     def save_for_graspnet():
         if _state["last_segmentation"] is None:
-            return {"success": False, "error": "No segmentation results found, call segment_objects() first."}
-        return save_graspnet_image(
+            return {
+                "success": False,
+                "error": "No segmentation results found, call segment_objects() first."
+            }
+
+        result = save_graspnet_image(
             _state["last_segmentation"],
             rgbd_path="captures/rgbd/rgbd_image.npz",
             output_path="/ros-ai-agent/captures/segmentation/rgbd_sgmtd/rgbd_sgmtd.npz",
         )
+
+        if result.get("success", False):
+            _state["last_segmentation"] = None
+
+        return result
 
     @tool(name_or_callable="get_place_pose",
           description="Get placement pose on top of a segmented object. "
@@ -248,6 +262,7 @@ def get_tools(node):
         _state["last_segmentation"] = result
         if _state["last_segmentation"] is None:
             return {"success": False, "error": "Segmentation failed. Results not cached."}
+
         return result
 
     @tool(name_or_callable="describe_environment",

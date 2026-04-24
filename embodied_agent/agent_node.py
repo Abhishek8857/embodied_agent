@@ -15,7 +15,7 @@ from .utils.episode_recorder import EpisodeRecorder
 from .utils.recovery_advisor import RecoveryAdvisor
 from .utils.episode_summarizer import build_summary
 from .config import get_config
-from .llm import get_qwen_llm  
+from .llm import get_qwen_llm
 from .context import Context
 
 from pathlib import Path
@@ -29,7 +29,7 @@ def _extract_failure(result: dict, query: str) -> str | None:
 
     # DEBUG:
     print(f"Structured outcome is {structured.outcome}")
-    
+
     if structured is None:
         return None  # no structured output — treat as success
 
@@ -42,9 +42,26 @@ def _extract_failure(result: dict, query: str) -> str | None:
 
     return None
 
-# ---------------------------------------------------------------------------
-# Agent node
-# ---------------------------------------------------------------------------
+
+def _extract_completed_steps(result: dict) -> list[str]:
+    """
+    Walk the message history from the previous attempt and collect
+    the names of tool calls that returned successfully.
+    Skips any tool whose result contains 'error' or 'failed'.
+    """
+    completed = []
+    messages = result.get("messages", [])
+
+    for msg in messages:
+        if isinstance(msg, ToolMessage):
+            tool_name = getattr(msg, "name", None)
+            content = msg.content or ""
+
+            if tool_name and "error" not in content.lower() and "failed" not in content.lower():
+                completed.append(tool_name)
+
+    return completed
+
 
 class Agent(Node):
     def __init__(self):
@@ -52,7 +69,7 @@ class Agent(Node):
         qos_profile: QoSProfile = QoSProfile(depth=1, durability=QoSDurabilityPolicy.VOLATILE)
         self.subscription = self.create_subscription(String, "query", self.query_callback, qos_profile=qos_profile)
         tools = get_tools(self)
-            
+
         self.agent = build_embodied_agent(tools=tools)
 
         self.recorder = EpisodeRecorder(save_dir=EPISODES_DIR)
@@ -140,14 +157,37 @@ class Agent(Node):
                         )
                     else:
                         self.get_logger().warning(
-                            f"Attempt {attempt} failed: {failure}. Retrying without hint."
+                            f"Attempt {attempt} failed: {failure}. Retrying with execution context."
                         )
+
+                        # Build context of what was already accomplished
+                        completed_steps = _extract_completed_steps(result)
+
+                        if completed_steps:
+                            completed_summary = "\n".join(
+                                f"  - {step}" for step in completed_steps
+                            )
+                            context_block = (
+                                f"WHAT WAS ALREADY COMPLETED IN THE PREVIOUS ATTEMPT:\n"
+                                f"{completed_summary}\n\n"
+                                f"DO NOT repeat these steps. Continue from the point of failure.\n"
+                                f"If pick_up_object appears above, the robot is currently holding "
+                                f"the object — do NOT re-pick it.\n"
+                                f"If move_to_named_pose(home) appears above, the robot is at home.\n"
+                            )
+                        else:
+                            context_block = (
+                                f"No steps were completed before the failure. "
+                                f"Re-execute the full task from scratch with fresh perception "
+                                f"and segmentation.\n"
+                            )
+
                         retry_body = (
                             f"[RETRY — Attempt {attempt + 1}/{max_attempts}]\n"
-                            f"The previous attempt did not complete the task. Return to Home pose.\n"
+                            f"The previous attempt failed at the following step:\n"
                             f"Reason: {failure}\n\n"
-                            f"ALWAYS return to home pose first, then determine which part of the task has failed and continue from there."
-                            f"In case of complete failure, re-execute the original task with fresh perception and segmentation of the objects to be handled if required :\n"
+                            f"{context_block}"
+                            f"(check completed steps above). Then continue the original task:\n"
                             f"{user_query}"
                         )
 
