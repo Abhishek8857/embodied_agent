@@ -171,7 +171,6 @@ def get_tools(node):
     def get_latest_grasp_pose(max_age_s: float = 20.0):
         return grasp_pose_lookup.get_latest(max_age_s=float(max_age_s or 5.0))
 
-    # ── Manipulation tools ─────────────────────────────────────────────────────
 
     @tool(name_or_callable="pick_up_object",
           description="Picks up object at a specified pose (x, y, z, qx, qy, qz, qw).")
