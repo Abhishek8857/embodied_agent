@@ -1,5 +1,6 @@
 import os
 import json
+import cv2
 from io import BytesIO
 
 import numpy as np
@@ -168,46 +169,88 @@ class GeminiSegmentor:
 
 
     def _process_points(self, rgb: np.ndarray, depth: np.ndarray,
-                        K: np.ndarray, points_data: list[dict]) -> list[dict]:
+                        K: np.ndarray, points_data: list[dict],
+                        depth_tol_m: float = 0.03) -> list[dict]:
         """
-        Convert Gemini point detections to circular pixel masks + 3D grasp centres.
-
-        Each returned point is expanded into a circle whose radius is ~5 % of the
-        smallest image dimension, matching the KinovaOps3 reference implementation.
-        """
+        Convert Gemini point detections to object-shaped masks via depth region growing.
+ 
+        Strategy
+        --------
+        1. De-normalise the returned [y, x] point to pixel coordinates.
+        2. Sample the depth at that pixel to get the object's distance z_seed.
+        3. Build a binary candidate map: all pixels whose depth is within
+           ±depth_tol_m of z_seed  AND  within a generous search radius
+           (30 % of min image dimension) of the seed point.
+        4. Run connected-components on that map and keep only the component
+           that contains the seed pixel — this traces the actual object shape
+           rather than an arbitrary circle.
+        5. Fall back to a plain circle if depth is unavailable.
+ 
+        Args:
+            depth_tol_m: Depth tolerance in metres (default 3 cm). Increase for
+                         noisy sensors; decrease if objects are very close together.
+        """ 
         H, W = rgb.shape[:2]
         fx, fy = K[0, 0], K[1, 1]
         cx, cy = K[0, 2], K[1, 2]
-
+ 
         results = []
         for item in points_data:
             point = item.get("point")
             if not point or len(point) < 2:
                 continue
-
-            # De-normalise 0–1000 → pixel coordinates
+ 
+            # 1. De-normalise 0–1000 → pixel coordinates
             py = int(np.clip(point[0] / 1000.0 * H, 0, H - 1))
             px = int(np.clip(point[1] / 1000.0 * W, 0, W - 1))
-
-            # Circular mask (~5 % of smallest dimension)
-            radius = int(min(H, W) * 0.05)
-            ys_grid, xs_grid = np.ogrid[:H, :W]
-            full_mask = ((xs_grid - px) ** 2 + (ys_grid - py) ** 2) <= radius ** 2
-
-            # Bounding box of the circle
-            x0 = max(0, px - radius)
-            x1 = min(W, px + radius)
-            y0 = max(0, py - radius)
-            y1 = min(H, py + radius)
-
+ 
+            # 2. Seed depth at the clicked point
+            z_seed = float(depth[py, px])
+ 
+            full_mask = None
+ 
+            if z_seed > 0 and np.isfinite(z_seed):
+                # 3. Candidate map: depth-similar pixels within search radius
+                search_radius = int(min(H, W) * 0.30)
+                ys_grid, xs_grid = np.ogrid[:H, :W]
+                in_radius = (
+                    (xs_grid - px) ** 2 + (ys_grid - py) ** 2
+                ) <= search_radius ** 2
+ 
+                depth_close = (
+                    np.abs(depth - z_seed) <= depth_tol_m
+                ) & (depth > 0) & np.isfinite(depth)
+ 
+                candidate = (in_radius & depth_close).astype(np.uint8)
+ 
+                # 4. Connected components → keep seed component
+                num_labels, labels = cv2.connectedComponents(candidate)
+                seed_label = labels[py, px]
+ 
+                if seed_label > 0:
+                    full_mask = labels == seed_label
+ 
+            # 5. Fallback: small circle (no depth available)
+            if full_mask is None or not full_mask.any():
+                fallback_radius = int(min(H, W) * 0.05)
+                ys_grid, xs_grid = np.ogrid[:H, :W]
+                full_mask = (
+                    (xs_grid - px) ** 2 + (ys_grid - py) ** 2
+                ) <= fallback_radius ** 2
+ 
+            # Bounding box from mask extent
+            ys_m, xs_m = np.where(full_mask)
+            x0, x1 = int(xs_m.min()), int(xs_m.max())
+            y0, y1 = int(ys_m.min()), int(ys_m.max())
+ 
             grasp_3d = self._compute_grasp_center(full_mask, depth, fx, fy, cx, cy)
             if grasp_3d is None:
-                continue   # skip points with no valid depth
-
+                continue
+ 
             placement_3d = self._compute_placement_surface(
                 full_mask, depth, fx, fy, cx, cy
             )
-
+ 
             results.append({
                 "label":                item.get("label", ""),
                 "box_pixels":           {"x_min": x0, "y_min": y0, "x_max": x1, "y_max": y1},
@@ -216,7 +259,7 @@ class GeminiSegmentor:
                 "grasp_center_3d":      grasp_3d,
                 "placement_surface_3d": placement_3d,
             })
-
+ 
         return results
 
     @staticmethod
