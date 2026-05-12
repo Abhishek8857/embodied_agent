@@ -175,49 +175,58 @@ class GeminiSegmentor:
     def _process_points(self, rgb: np.ndarray, depth: np.ndarray,
                         K: np.ndarray, points_data: list[dict],
                         depth_tol_m: float = 0.03,
-                        color_tol_lab: float = 22.0) -> list[dict]:
+                        color_tol_lab: float = 30.0) -> list[dict]:
         """
         Convert Gemini point detections to object-shaped masks.
-
+ 
         Strategy
         --------
         Candidates must satisfy ALL three constraints simultaneously:
           1. Within a moderate search window (~15 % of min dimension) of seed.
           2. Depth within ±depth_tol_m of the seed pixel's depth.
           3. Color (CIE-Lab) within color_tol_lab of the seed pixel's color.
-
+ 
         Using color prevents the flood fill from spilling onto flat surfaces
         (table, floor) that share the same depth as the object's base pixels.
         Connected-components then isolates the object's own blob.
-
+ 
         Args:
             depth_tol_m:    Depth tolerance in metres  (default 3 cm).
-            color_tol_lab:  CIE-Lab ΔE tolerance       (default 22). Lower = stricter.
+            color_tol_lab:  CIE-Lab ΔE tolerance       (default 30). Lower = stricter.
         """
-
+        import cv2
+ 
         H, W = rgb.shape[:2]
         fx, fy = K[0, 0], K[1, 1]
         cx, cy = K[0, 2], K[1, 2]
-
+ 
         # Convert full image to Lab once (float32, L in [0,100])
         rgb_u8  = rgb.astype(np.uint8)
         lab_img = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2Lab).astype(np.float32)
-
+ 
         results = []
         for item in points_data:
             point = item.get("point")
             if not point or len(point) < 2:
                 continue
-
+ 
             # 1. De-normalise 0–1000 → pixel coordinates
             py = int(np.clip(point[0] / 1000.0 * H, 0, H - 1))
             px = int(np.clip(point[1] / 1000.0 * W, 0, W - 1))
-
-            z_seed   = float(depth[py, px])
-            lab_seed = lab_img[py, px]          # shape (3,)
-
+ 
+            z_seed = float(depth[py, px])
+ 
+            # Sample seed color from a small patch (5 px radius) so we don't
+            # land on a single highlight / shadow pixel
+            ph = 5
+            y0p = max(0, py - ph);  y1p = min(H, py + ph + 1)
+            x0p = max(0, px - ph);  x1p = min(W, px + ph + 1)
+            lab_seed = np.median(
+                lab_img[y0p:y1p, x0p:x1p].reshape(-1, 3), axis=0
+            )  # shape (3,)
+ 
             full_mask = None
-
+ 
             if z_seed > 0 and np.isfinite(z_seed):
                 # 2. Search window — moderate radius keeps bleed-out in check
                 search_radius = int(min(H, W) * 0.15)
@@ -225,26 +234,26 @@ class GeminiSegmentor:
                 in_radius = (
                     (xs_grid - px) ** 2 + (ys_grid - py) ** 2
                 ) <= search_radius ** 2
-
+ 
                 # 3. Depth gate
                 depth_ok = (
                     np.abs(depth - z_seed) <= depth_tol_m
                 ) & (depth > 0) & np.isfinite(depth)
-
+ 
                 # 4. Color gate (Euclidean ΔE in Lab space)
                 delta_lab   = lab_img - lab_seed           # (H, W, 3)
                 color_dist  = np.linalg.norm(delta_lab, axis=2)  # (H, W)
                 color_ok    = color_dist <= color_tol_lab
-
+ 
                 candidate = (in_radius & depth_ok & color_ok).astype(np.uint8)
-
+ 
                 # 5. Connected components → keep seed component
                 _, labels = cv2.connectedComponents(candidate)
                 seed_label = int(labels[py, px])
-
+ 
                 if seed_label > 0:
                     full_mask = labels == seed_label
-
+ 
             # Fallback: small circle when depth / color unavailable
             if full_mask is None or not np.any(full_mask):
                 fallback_radius = int(min(H, W) * 0.05)
@@ -252,20 +261,20 @@ class GeminiSegmentor:
                 full_mask = (
                     (xs_grid - px) ** 2 + (ys_grid - py) ** 2
                 ) <= fallback_radius ** 2
-
+ 
             # Bounding box from actual mask extent
             ys_m, xs_m = np.where(full_mask)
             x0, x1 = int(xs_m.min()), int(xs_m.max())
             y0, y1 = int(ys_m.min()), int(ys_m.max())
-
+ 
             grasp_3d = self._compute_grasp_center(full_mask, depth, fx, fy, cx, cy)
             if grasp_3d is None:
                 continue
-
+ 
             placement_3d = self._compute_placement_surface(
                 full_mask, depth, fx, fy, cx, cy
             )
-
+ 
             results.append({
                 "label":                item.get("label", ""),
                 "box_pixels":           {"x_min": x0, "y_min": y0, "x_max": x1, "y_max": y1},
@@ -274,7 +283,7 @@ class GeminiSegmentor:
                 "grasp_center_3d":      grasp_3d,
                 "placement_surface_3d": placement_3d,
             })
-
+ 
         return results
 
     @staticmethod
