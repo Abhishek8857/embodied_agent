@@ -1,6 +1,7 @@
 import os
 import json
 import cv2
+
 from io import BytesIO
 
 import numpy as np
@@ -30,6 +31,9 @@ class GeminiSegmentor:
     def __init__(self):
         self._client = genai.Client(api_key=get_gemini_api_key())
 
+    # ------------------------------------------------------------------ #
+    #  Public API                                                          #
+    # ------------------------------------------------------------------ #
 
     def segment(self, npz_path: str, query: str,
                 save_visualizations: bool = True,
@@ -170,96 +174,107 @@ class GeminiSegmentor:
 
     def _process_points(self, rgb: np.ndarray, depth: np.ndarray,
                         K: np.ndarray, points_data: list[dict],
-                        depth_tol_m: float = 0.03) -> list[dict]:
+                        depth_tol_m: float = 0.03,
+                        color_tol_lab: float = 22.0) -> list[dict]:
         """
-        Convert Gemini point detections to object-shaped masks via depth region growing.
- 
+        Convert Gemini point detections to object-shaped masks.
+
         Strategy
         --------
-        1. De-normalise the returned [y, x] point to pixel coordinates.
-        2. Sample the depth at that pixel to get the object's distance z_seed.
-        3. Build a binary candidate map: all pixels whose depth is within
-           ±depth_tol_m of z_seed  AND  within a generous search radius
-           (30 % of min image dimension) of the seed point.
-        4. Run connected-components on that map and keep only the component
-           that contains the seed pixel — this traces the actual object shape
-           rather than an arbitrary circle.
-        5. Fall back to a plain circle if depth is unavailable.
- 
+        Candidates must satisfy ALL three constraints simultaneously:
+          1. Within a moderate search window (~15 % of min dimension) of seed.
+          2. Depth within ±depth_tol_m of the seed pixel's depth.
+          3. Color (CIE-Lab) within color_tol_lab of the seed pixel's color.
+
+        Using color prevents the flood fill from spilling onto flat surfaces
+        (table, floor) that share the same depth as the object's base pixels.
+        Connected-components then isolates the object's own blob.
+
         Args:
-            depth_tol_m: Depth tolerance in metres (default 3 cm). Increase for
-                         noisy sensors; decrease if objects are very close together.
-        """ 
+            depth_tol_m:    Depth tolerance in metres  (default 3 cm).
+            color_tol_lab:  CIE-Lab ΔE tolerance       (default 22). Lower = stricter.
+        """
+
         H, W = rgb.shape[:2]
         fx, fy = K[0, 0], K[1, 1]
         cx, cy = K[0, 2], K[1, 2]
- 
+
+        # Convert full image to Lab once (float32, L in [0,100])
+        rgb_u8  = rgb.astype(np.uint8)
+        lab_img = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2Lab).astype(np.float32)
+
         results = []
         for item in points_data:
             point = item.get("point")
             if not point or len(point) < 2:
                 continue
- 
+
             # 1. De-normalise 0–1000 → pixel coordinates
             py = int(np.clip(point[0] / 1000.0 * H, 0, H - 1))
             px = int(np.clip(point[1] / 1000.0 * W, 0, W - 1))
- 
-            # 2. Seed depth at the clicked point
-            z_seed = float(depth[py, px])
- 
+
+            z_seed   = float(depth[py, px])
+            lab_seed = lab_img[py, px]          # shape (3,)
+
             full_mask = None
- 
+
             if z_seed > 0 and np.isfinite(z_seed):
-                # 3. Candidate map: depth-similar pixels within search radius
-                search_radius = int(min(H, W) * 0.30)
+                # 2. Search window — moderate radius keeps bleed-out in check
+                search_radius = int(min(H, W) * 0.15)
                 ys_grid, xs_grid = np.ogrid[:H, :W]
                 in_radius = (
                     (xs_grid - px) ** 2 + (ys_grid - py) ** 2
                 ) <= search_radius ** 2
- 
-                depth_close = (
+
+                # 3. Depth gate
+                depth_ok = (
                     np.abs(depth - z_seed) <= depth_tol_m
                 ) & (depth > 0) & np.isfinite(depth)
- 
-                candidate = (in_radius & depth_close).astype(np.uint8)
- 
-                # 4. Connected components → keep seed component
-                num_labels, labels = cv2.connectedComponents(candidate)
-                seed_label = labels[py, px]
- 
+
+                # 4. Color gate (Euclidean ΔE in Lab space)
+                delta_lab   = lab_img - lab_seed           # (H, W, 3)
+                color_dist  = np.linalg.norm(delta_lab, axis=2)  # (H, W)
+                color_ok    = color_dist <= color_tol_lab
+
+                candidate = (in_radius & depth_ok & color_ok).astype(np.uint8)
+
+                # 5. Connected components → keep seed component
+                _, labels = cv2.connectedComponents(candidate)
+                seed_label = int(labels[py, px])
+
                 if seed_label > 0:
                     full_mask = labels == seed_label
- 
-            # 5. Fallback: small circle (no depth available)
-            if full_mask is None or not full_mask.any():
+
+            # Fallback: small circle when depth / color unavailable
+            if full_mask is None or not np.any(full_mask):
                 fallback_radius = int(min(H, W) * 0.05)
                 ys_grid, xs_grid = np.ogrid[:H, :W]
                 full_mask = (
                     (xs_grid - px) ** 2 + (ys_grid - py) ** 2
                 ) <= fallback_radius ** 2
- 
-            # Bounding box from mask extent
+
+            # Bounding box from actual mask extent
             ys_m, xs_m = np.where(full_mask)
             x0, x1 = int(xs_m.min()), int(xs_m.max())
             y0, y1 = int(ys_m.min()), int(ys_m.max())
- 
+
             grasp_3d = self._compute_grasp_center(full_mask, depth, fx, fy, cx, cy)
             if grasp_3d is None:
                 continue
- 
+
             placement_3d = self._compute_placement_surface(
                 full_mask, depth, fx, fy, cx, cy
             )
- 
+
             results.append({
                 "label":                item.get("label", ""),
                 "box_pixels":           {"x_min": x0, "y_min": y0, "x_max": x1, "y_max": y1},
-                "mask":                 full_mask,                          # bool (H, W)
-                "mask_array":           full_mask.astype(np.uint8) * 255,   # uint8 for saving
+                "mask":                 full_mask,
+                "mask_array":           full_mask.astype(np.uint8) * 255,
                 "grasp_center_3d":      grasp_3d,
                 "placement_surface_3d": placement_3d,
             })
- 
+
         return results
 
     @staticmethod
