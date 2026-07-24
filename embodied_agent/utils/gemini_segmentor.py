@@ -175,7 +175,7 @@ class GeminiSegmentor:
     def _process_points(self, rgb: np.ndarray, depth: np.ndarray,
                         K: np.ndarray, points_data: list[dict],
                         depth_tol_m: float = 0.03,
-                        color_tol_lab: float = 30.0) -> list[dict]:
+                        color_tol_lab: float = 50.0) -> list[dict]:
         """
         Convert Gemini point detections to object-shaped masks.
  

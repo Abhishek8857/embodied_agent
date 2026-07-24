@@ -45,7 +45,7 @@ class TfPoseLookup:
         for t in msg.transforms:
             self.buffer.set_transform_static(t, "tf_listener")
 
-    def get_pose(self, base_frame: str, ee_frame: str, timeout_s: float = 1.0) -> Dict[str, Any]:
+    def get_pose(self, base_frame: str, ee_frame: str, timeout_s: float = 5.0) -> Dict[str, Any]:
         deadline = time.time() + float(timeout_s)
 
         while time.time() < deadline:

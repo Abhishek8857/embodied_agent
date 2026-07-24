@@ -17,7 +17,7 @@ from .utils.register_poses import RegisterPoses
 def get_tools(node):
     motion = ExecuteMotionClient(action_name="/execute_motion", expected_joint_len=7)
     tf_lookup = TfPoseLookup(node)
-    joint_state_lookup = JointStateCache(node, topic="/isaac_joint_states")
+    joint_state_lookup = JointStateCache(node, topic="/joint_states")
     grasp_pose_lookup = GraspPoseCache(node, topic="/grasp_pose")
     segmentor = GeminiSegmentor()
     pose_registry = RegisterPoses(path="poses/poses.json")
@@ -129,8 +129,8 @@ def get_tools(node):
             timeout_s:  Lookup timeout in seconds
         """
         base_frame = base_frame or "base_link"
-        ee_frame   = ee_frame   or "end_ffector_link"
-        timeout_s  = timeout_s  or 1.0
+        ee_frame   = ee_frame   or "end_effector_link"
+        timeout_s  = timeout_s  or 3.0
         return tf_lookup.get_pose(base_frame, ee_frame, timeout_s)
 
     @tool(name_or_callable="get_current_joint_states",
@@ -143,14 +143,14 @@ def get_tools(node):
           description="Captures the RGB image, saves locally and returns path.")
     def capture_only_rgb_image():
         return {"path": capture_rgb_image(node,
-                                          topic="/front_stereo_camera/rgb/image_raw",
+                                          topic="/camera/color/image_raw",
                                           save_dir="captures/rgb")}
 
     @tool(name_or_callable="capture_only_depth_image",
           description="Captures depth image, saves it locally and returns path.")
     def capture_only_depth_image():
         return {"path": capture_raw_depth_image(node,
-                                                topic="/front_stereo_camera/depth/image_rect_raw",
+                                                topic="/camera/depth_registered/image_rect",
                                                 save_dir="captures/depth")}
 
     @tool(name_or_callable="capture_rgbd",
@@ -160,9 +160,9 @@ def get_tools(node):
             node,
             save_dir="captures/rgbd",
             filename="rgbd_image.npz",
-            rgb_topic="/front_stereo_camera/rgb/image_raw",
-            depth_topic="/front_stereo_camera/depth/image_rect_raw",
-            camera_info_topic="/front_stereo_camera/rgb/camera_info",
+            rgb_topic="/camera/color/image_raw",
+            depth_topic="/camera/depth_registered/image_rect",
+            camera_info_topic="/camera/depth_registered/camera_info",
             timeout_s=2.0,
         )
 
