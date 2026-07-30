@@ -176,10 +176,10 @@ def get_openrouter_api_key() -> str:
         str: API Key
     """
     try:
-        with open("openrouter_api_key.config", "r") as f:
+        with open("openai_api_key.config", "r") as f:
             api_key = os.environ["OPENAI_API_KEY"] = f.read().strip()
     except FileNotFoundError:
-        raise RuntimeError("Missing openrouter_api_key.config file")
+        raise RuntimeError("Missing openai_api_key.config file")
     
     return api_key
 
