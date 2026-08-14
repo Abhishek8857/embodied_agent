@@ -4,15 +4,37 @@ import math
 import json
 import os
 from pathlib import Path
+from ament_index_python.packages import get_package_share_directory
 from langchain_core.tools import tool
 from .nav2_action_client import Nav2ActionClient
 from .utils import relative_move, quat_to_rpy
 
-LOCATIONS_PATH = Path(__file__).parent.parent / "locations" / "saved_locations.json"
+# Stable, install/build-independent location for runtime-mutable data.
+# Override with the ROBOT_LOCATIONS_PATH env var if you need a different path
+# (e.g. for testing, or a shared location on a robot fleet).
+LOCATIONS_PATH = Path(os.environ.get(
+    "ROBOT_LOCATIONS_PATH",
+    "/ros-ai-agent/locations/saved_locations.json"
+))
+LOCATIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+
 
 def _load_locations() -> dict:
-    with open(LOCATIONS_PATH, "r") as f:
-        return json.load(f)
+    try:
+        with open(LOCATIONS_PATH, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        # Corrupt/empty file — don't crash the tool, just start fresh.
+        return {}
+
+
+def _save_locations(locations: dict) -> None:
+    LOCATIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOCATIONS_PATH, "w") as f:
+        json.dump(locations, f, indent=2)
+
 
 def get_tools(node) -> list:
     nav2_client = Nav2ActionClient(namespace="kairosAB")
@@ -48,7 +70,6 @@ def get_tools(node) -> list:
         """
         locations = _load_locations()
 
-        # Case-insensitive lookup
         key = next((k for k in locations if k.lower() == location_name.strip().lower()), None)
         if key is None:
             available = ", ".join(f'"{k}"' for k in locations)
@@ -65,7 +86,6 @@ def get_tools(node) -> list:
         x = pos["x"]
         y = pos["y"]
 
-        # Convert full quaternion → yaw using existing util
         _, _, yaw_rad = quat_to_rpy(ori["x"], ori["y"], ori["z"], ori["w"])
         yaw_degrees   = math.degrees(yaw_rad)
 
@@ -88,7 +108,6 @@ def get_tools(node) -> list:
         if "x" not in pose:
             return pose
 
-        # Convert yaw back to quaternion (planar: x=0, y=0)
         yaw_rad = math.radians(pose["yaw_degrees"])
         entry = {
             "position": {
@@ -107,17 +126,16 @@ def get_tools(node) -> list:
         locations = _load_locations()
         already_exists = location_name.strip().lower() in [k.lower() for k in locations]
         locations[location_name.strip()] = entry
-
-        with open(LOCATIONS_PATH, "w") as f:
-            json.dump(locations, f, indent=2)
+        _save_locations(locations)
 
         action = "updated" if already_exists else "saved"
         return {
             "success": True,
             "status":  action,
-            "message": f'Location "{location_name}" {action} at x={pose["x"]:.4f}, y={pose["y"]:.4f}, yaw={pose["yaw_degrees"]:.2f}°',
+            "message": f'Location "{location_name}" {action} at x={pose["x"]:.4f}, y={pose["y"]:.4f}, yaw={pose["yaw_degrees"]:.2f}° '
+                       f'(file: {LOCATIONS_PATH})',
         }
-        
+
     @tool
     def delete_location(location_name: str) -> dict:
         """
@@ -142,16 +160,14 @@ def get_tools(node) -> list:
             }
 
         del locations[key]
-
-        with open(LOCATIONS_PATH, "w") as f:
-            json.dump(locations, f, indent=2)
+        _save_locations(locations)
 
         return {
             "success": True,
             "status":  "deleted",
             "message": f'Location "{key}" has been deleted.',
         }
-        
+
     @tool
     def list_locations() -> dict:
         """
@@ -223,7 +239,7 @@ def get_tools(node) -> list:
         pose = nav2_client.get_current_pose()
         if "x" not in pose:
             return pose
-        target = relative_move(pose, distance_x=0.0, distance_y=-distance)
+        target = relative_move(pose, distance_x=0.0, distance_y=distance)
         return nav2_client.navigate_to_pose(**target)
 
     @tool
@@ -240,7 +256,7 @@ def get_tools(node) -> list:
         pose = nav2_client.get_current_pose()
         if "x" not in pose:
             return pose
-        target = relative_move(pose, distance_x=0.0, distance_y=distance)
+        target = relative_move(pose, distance_x=0.0, distance_y=-distance)
         return nav2_client.navigate_to_pose(**target)
 
     @tool

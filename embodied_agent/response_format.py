@@ -23,8 +23,14 @@ class ResponseFormat(BaseModel):
     task_type: Literal["action", "query"] = "query"
     outcome: Literal["success", "failed"] = "success"
     failure_reason: str | None = None
-    distance_traveled: float | None = None 
+    distance_traveled: float | None = None
 
+    @field_validator("answer", mode="before")
+    @classmethod
+    def coerce_complex_answer_to_str(cls, v):
+        if isinstance(v, (list, dict)):
+            return json.dumps(v)
+        return v
 
     class Config:
         extra = "forbid"

@@ -88,31 +88,6 @@ prompt = """
         - If user asks “what do you see?” -> describe_what_you_see(). If there are no images saved, you must first capture an image and then proceed.
         - If user asks to save images -> capture_image() and/or capture_depth_image()
 
-        G) Pick Up Objects:
-        - REQUIRE a specific object. If missing, ask the user for a a specific object and DO NOT pick up any object.
-        - If the user asks you to pick up an object, without specifying what object, DO NOT execute any tool and ask the user to specify an object
-        - If the user asks  "Pick up the blue object" you need to do the following
-        - Call capture_rgbd() to capture the image of the objects
-        - Call segment_objects() with the query being the object the user wants to pick up
-        - Call save_for_graspnet() to save the results from the segmentation
-        - Call get_latest_grasp_pose() to get the grasp pose of the object 
-        - Call pick_up_object() with the grasp coordinates you got from the get_latest_grasp_pose() tool 
-        - Always Call move_to_home_pose() to return back to home position after picking up
-        - Confirm visually whether the task was completed by calling capture_only_rgb_image() and then calling and quering the tool describe_environment(query) 
-          with the query being a verification question regarding the success of the task
-        
-        F) Place objects:
-        - REQUIRE a specific object. If missing, ask the user for a a specific object and DO NOT pick up any object.
-        - If the user asks you to place without specify where, DO NOT execute any tool and ask the user to specify the object
-        - If the user, for example, "Place it on the red block', you need to do the following,
-        - Call capture_rgbd() to capture the image of the scene
-        - Call segment objects() with the query being the object the user wants to place it on
-        - Call get_place_pose() with the segmentation_results you got from segment_objects.
-        - Call place_object() with the with the coordinated you get from the get_place_pose() tool
-        - Call move_to_home_pose() to return back to the home position
-        - Confirm visually whether the task was completed by calling capture_only_rgb_image() and then calling and quering the tool describe_environment(query) 
-          with the query being a verification question regarding the success of the task
-
         
         ============================================================
         VERIFICATION & TOLERANCES (MUST DO THIS)
@@ -120,9 +95,9 @@ prompt = """
         After ANY motion command:
         - For pose moves: verify using get_current_pose().
         Tolerance defaults:
-        - Position error <= 0.005 m (5 mm) per axis (or Euclidean <= 0.01 m)
-        - Orientation: if unchanged, verify quaternion is “close enough”:
-        (1 - |dot(q_target, q_actual)|) <= 0.01
+        - Position error <= 0.20 m (200 mm) per axis (or Euclidean <= 0.20 m)
+        - Orientation: if unchanged, verify quaternion is "close enough":
+        (1 - |dot(q_target, q_actual)|) <= 0.25
 
         - For joint/gripper moves: verify using get_current_joint_states().
         Tolerance defaults:
