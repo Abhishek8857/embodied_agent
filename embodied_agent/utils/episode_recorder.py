@@ -68,6 +68,8 @@ class Episode:
         self.episode_id = f"ep_{episode_number:04d}"
         self.session_id = session_id
         self.query = query
+        self.ai_messages: list[str] = [] 
+        self.retries: dict = {"count": 0, "attempts": []}
         self.timestamp_start = datetime.now().isoformat()
         self.timestamp_end: Optional[str] = None
         self.duration_s: Optional[float] = None
@@ -76,18 +78,19 @@ class Episode:
         self.final_response: Optional[str] = None
         self.outcome: str = "unknown"   # "success" | "error" | "unknown"
         self.error: Optional[str] = None
-        self.retries: list[dict] = []
-        
-    def record_retry(self, attempt: int, failure_reason: str, hint_used: Optional[str]):
-        self.retries.append({
+
+    def add_tool_call(self, tool: str, args: dict, output: str, tool_call_id: str):
+        step = len(self.tool_calls) + 1
+        self.tool_calls.append(ToolCallRecord(step, tool, args, output, tool_call_id))
+
+    def record_retry(self, attempt: int, failure_reason: str, hint_used: str):
+        """Called before each retry attempt to track what was tried."""
+        self.retries["count"] = attempt
+        self.retries["attempts"].append({
             "attempt": attempt,
             "failure_reason": failure_reason,
             "hint_used": hint_used,
         })
-        
-    def add_tool_call(self, tool: str, args: dict, output: str, tool_call_id: str):
-        step = len(self.tool_calls) + 1
-        self.tool_calls.append(ToolCallRecord(step, tool, args, output, tool_call_id))
 
     def close(self, final_response: str, outcome: str = "success", error: str = None):
         self.final_response = final_response
@@ -106,6 +109,7 @@ class Episode:
             "duration_s": self.duration_s,
             "query": self.query,
             "retries": self.retries,
+            "ai_messages": self.ai_messages,
             "tool_calls": [tc.to_dict() for tc in self.tool_calls],
             "final_response": self.final_response,
             "outcome": self.outcome,
@@ -146,6 +150,7 @@ class EpisodeRecorder:
         self._filepath = self.save_dir / f"{self.session_id}.json"
         self._init_file()
 
+    # ── Public API ────────────────────────────────────────────────────────────
 
     def start_episode(self, query: str) -> Episode:
         """Open a new episode for the given user query."""
@@ -163,38 +168,33 @@ class EpisodeRecorder:
             self._flush()
 
     def close_episode_from_formatted_response(self, episode: Episode,
-                                              formatted: dict,
-                                              outcome: str = "success",
-                                              error: str = None):
-        """
-        Convenience wrapper: populate tool calls from the dict produced by
-        utils.format_response() and then close the episode.
-
-        formatted = {
-            "human_messages": [...],
-            "ai_messages":    [...],   # tool call intentions
-            "tool_calls":     [...],   # tool outputs
-            "final_response": [...],
-        }
-        """
+                                        formatted: dict,
+                                        outcome: str = "success",
+                                        error: str = None):
         # Build a quick lookup: tool_call_id → output dict
         tool_output_map = {t["tool_call_id"]: t for t in formatted.get("tool_calls", [])}
 
-        for ai_msg in formatted.get("ai_messages", []):
-            tool_call_id = ai_msg.get("id", "")
-            tool_name    = ai_msg.get("name", "unknown")
-            args         = ai_msg.get("args", {})
-            output_entry = tool_output_map.get(tool_call_id, {})
-            output_str   = output_entry.get("output", "")
-            if tool_call_id in self._seen_tool_call_ids:
-                continue  # skip: carried over from a previous episode's LangGraph state
-            self._seen_tool_call_ids.add(tool_call_id)
-            episode.add_tool_call(tool=tool_name, args=args, output=output_str,
-                                  tool_call_id=tool_call_id)
+        # ai_messages is now a list of {"tool_calls": [...]} groups — unwrap them
+        for ai_turn in formatted.get("ai_messages", []):
+            for ai_msg in ai_turn.get("tool_calls", []):          # <-- unwrap group
+                tool_call_id = ai_msg.get("id", "")
+                tool_name    = ai_msg.get("name", "unknown")
+                args         = ai_msg.get("args", {})
+                output_entry = tool_output_map.get(tool_call_id, {})
+                output_str   = output_entry.get("output", "")
 
-        final_responses = formatted.get("final_response", [])
-        final_text = final_responses[-1]["content"] if final_responses else ""
+                if tool_call_id in self._seen_tool_call_ids:
+                    continue
+                self._seen_tool_call_ids.add(tool_call_id)
 
+                episode.add_tool_call(tool=tool_name, args=args, output=output_str,
+                                    tool_call_id=tool_call_id)
+
+        # Store all AI reasoning messages in order
+        all_ai_texts = formatted.get("final_response", [])
+        episode.ai_messages = [m["content"] for m in all_ai_texts]
+
+        final_text = all_ai_texts[-1]["content"] if all_ai_texts else ""
         self.close_episode(episode, final_response=final_text, outcome=outcome, error=error)
 
     def get_all_episodes(self) -> list[dict]:

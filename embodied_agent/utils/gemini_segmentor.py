@@ -16,10 +16,10 @@ class GeminiSegmentor:
     """
     Open-vocabulary object segmentation using Gemini Robotics model.
 
-    Uses gemini-robotics-er-1.6-preview which returns point-based detections
-    (not bounding boxes + masks). Each point is expanded into a circular mask
-    (~5% of the smallest image dimension) and back-projected through depth to
-    produce 3D grasp points.
+    Uses gemini-robotics-er-1.6-preview which returns point-based detections.
+    Each point is expanded into a 3D Euclidean spatial cluster with relaxed
+    color constraints to segment full multi-face object shapes and back-project
+    through depth to produce 3D grasp/placement points.
 
     Usage:
         segmentor = GeminiSegmentor()
@@ -32,7 +32,7 @@ class GeminiSegmentor:
         self._client = genai.Client(api_key=get_gemini_api_key())
 
     # ------------------------------------------------------------------ #
-    #  Public API                                                          #
+    #  Public API                                                        #
     # ------------------------------------------------------------------ #
 
     def segment(self, npz_path: str, query: str,
@@ -98,7 +98,6 @@ class GeminiSegmentor:
 
         return response
 
-
     @staticmethod
     def _load_npz(npz_path: str):
         """Load and validate RGBD data from .npz."""
@@ -129,7 +128,6 @@ class GeminiSegmentor:
             )
 
         return rgb, depth, K
-
 
     def _query_gemini(self, rgb: np.ndarray, query: str) -> list[dict]:
         """
@@ -171,110 +169,110 @@ class GeminiSegmentor:
 
         return self._parse_response(response.text)
 
-
     def _process_points(self, rgb: np.ndarray, depth: np.ndarray,
                         K: np.ndarray, points_data: list[dict],
-                        depth_tol_m: float = 0.03,
-                        color_tol_lab: float = 30.0) -> list[dict]:
+                        spatial_radius_m: float = 0.06,
+                        color_tol_lab: float = 55.0) -> list[dict]:
         """
-        Convert Gemini point detections to object-shaped masks.
- 
-        Strategy
-        --------
-        Candidates must satisfy ALL three constraints simultaneously:
-          1. Within a moderate search window (~15 % of min dimension) of seed.
-          2. Depth within ±depth_tol_m of the seed pixel's depth.
-          3. Color (CIE-Lab) within color_tol_lab of the seed pixel's color.
- 
-        Using color prevents the flood fill from spilling onto flat surfaces
-        (table, floor) that share the same depth as the object's base pixels.
-        Connected-components then isolates the object's own blob.
- 
+        Convert Gemini point detections to object-shaped masks using 3D Euclidean clustering
+        and Lab color gating to segment all faces without flat-plane cutoff.
+
         Args:
-            depth_tol_m:    Depth tolerance in metres  (default 3 cm).
-            color_tol_lab:  CIE-Lab ΔE tolerance       (default 30). Lower = stricter.
+            spatial_radius_m: 3D Euclidean distance radius in metres (default 6 cm).
+            color_tol_lab:    CIE-Lab ΔE tolerance (default 55.0 to handle shading/shadows).
         """
-        import cv2
- 
         H, W = rgb.shape[:2]
         fx, fy = K[0, 0], K[1, 1]
         cx, cy = K[0, 2], K[1, 2]
- 
-        # Convert full image to Lab once (float32, L in [0,100])
-        rgb_u8  = rgb.astype(np.uint8)
+
+        # Convert full image to CIE-Lab
+        rgb_u8 = rgb.astype(np.uint8)
         lab_img = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2Lab).astype(np.float32)
- 
+
+        # Precompute 3D point cloud (Camera frame)
+        ys_grid, xs_grid = np.mgrid[:H, :W].astype(np.float32)
+        valid_depth = (depth > 0.05) & np.isfinite(depth)
+
+        Z_map = np.where(valid_depth, depth, 0.0).astype(np.float32)
+        X_map = np.where(valid_depth, (xs_grid - cx) * Z_map / fx, 0.0).astype(np.float32)
+        Y_map = np.where(valid_depth, (ys_grid - cy) * Z_map / fy, 0.0).astype(np.float32)
+
         results = []
         for item in points_data:
             point = item.get("point")
             if not point or len(point) < 2:
                 continue
- 
-            # 1. De-normalise 0–1000 → pixel coordinates
+
+            # 1. De-normalise 0–1000 -> pixel coordinates
             py = int(np.clip(point[0] / 1000.0 * H, 0, H - 1))
             px = int(np.clip(point[1] / 1000.0 * W, 0, W - 1))
- 
-            z_seed = float(depth[py, px])
- 
-            # Sample seed color from a small patch (5 px radius) so we don't
-            # land on a single highlight / shadow pixel
-            ph = 5
-            y0p = max(0, py - ph);  y1p = min(H, py + ph + 1)
-            x0p = max(0, px - ph);  x1p = min(W, px + ph + 1)
+
+            # Sample seed patch
+            ph = 3
+            y0p = max(0, py - ph); y1p = min(H, py + ph + 1)
+            x0p = max(0, px - ph); x1p = min(W, px + ph + 1)
+
+            patch_depth = depth[y0p:y1p, x0p:x1p]
+            valid_p_depth = patch_depth[(patch_depth > 0.05) & np.isfinite(patch_depth)]
+            z_seed = float(np.median(valid_p_depth)) if valid_p_depth.size > 0 else float(depth[py, px])
+
             lab_seed = np.median(
                 lab_img[y0p:y1p, x0p:x1p].reshape(-1, 3), axis=0
-            )  # shape (3,)
- 
+            )
+
             full_mask = None
- 
-            if z_seed > 0 and np.isfinite(z_seed):
-                # 2. Search window — moderate radius keeps bleed-out in check
-                search_radius = int(min(H, W) * 0.15)
-                ys_grid, xs_grid = np.ogrid[:H, :W]
-                in_radius = (
-                    (xs_grid - px) ** 2 + (ys_grid - py) ** 2
-                ) <= search_radius ** 2
- 
-                # 3. Depth gate
-                depth_ok = (
-                    np.abs(depth - z_seed) <= depth_tol_m
-                ) & (depth > 0) & np.isfinite(depth)
- 
-                # 4. Color gate (Euclidean ΔE in Lab space)
-                delta_lab   = lab_img - lab_seed           # (H, W, 3)
-                color_dist  = np.linalg.norm(delta_lab, axis=2)  # (H, W)
-                color_ok    = color_dist <= color_tol_lab
- 
-                candidate = (in_radius & depth_ok & color_ok).astype(np.uint8)
- 
-                # 5. Connected components → keep seed component
+
+            if z_seed > 0.05 and np.isfinite(z_seed):
+                x_seed = float((px - cx) * z_seed / fx)
+                y_seed = float((py - cy) * z_seed / fy)
+
+                # 2. 2D Search window constraint (moderate radius)
+                search_radius_px = int(min(H, W) * 0.20)
+                in_2d_radius = ((xs_grid - px) ** 2 + (ys_grid - py) ** 2) <= (search_radius_px ** 2)
+
+                # 3. 3D Euclidean distance gate
+                dist_3d_sq = (X_map - x_seed) ** 2 + (Y_map - y_seed) ** 2 + (Z_map - z_seed) ** 2
+                spatial_ok = valid_depth & (dist_3d_sq <= (spatial_radius_m ** 2))
+
+                # 4. Color gate (Lab ΔE)
+                delta_lab = lab_img - lab_seed
+                color_dist = np.linalg.norm(delta_lab, axis=2)
+                color_ok = color_dist <= color_tol_lab
+
+                candidate = (in_2d_radius & spatial_ok & color_ok).astype(np.uint8)
+
+                # 5. Connected components to isolate seed blob
                 _, labels = cv2.connectedComponents(candidate)
                 seed_label = int(labels[py, px])
- 
+
                 if seed_label > 0:
-                    full_mask = labels == seed_label
- 
-            # Fallback: small circle when depth / color unavailable
+                    full_mask = (labels == seed_label)
+                else:
+                    unique_labels = [l for l in np.unique(labels[y0p:y1p, x0p:x1p]) if l > 0]
+                    if unique_labels:
+                        full_mask = (labels == unique_labels[0])
+
+            # Fallback circle if depth or segmentation is invalid
             if full_mask is None or not np.any(full_mask):
                 fallback_radius = int(min(H, W) * 0.05)
-                ys_grid, xs_grid = np.ogrid[:H, :W]
-                full_mask = (
-                    (xs_grid - px) ** 2 + (ys_grid - py) ** 2
-                ) <= fallback_radius ** 2
- 
-            # Bounding box from actual mask extent
+                full_mask = ((xs_grid - px) ** 2 + (ys_grid - py) ** 2) <= fallback_radius ** 2
+
+            # Morphological close & fill holes to ensure solid object masks
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            full_mask = cv2.morphologyEx(full_mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel).astype(bool)
+
             ys_m, xs_m = np.where(full_mask)
             x0, x1 = int(xs_m.min()), int(xs_m.max())
             y0, y1 = int(ys_m.min()), int(ys_m.max())
- 
+
             grasp_3d = self._compute_grasp_center(full_mask, depth, fx, fy, cx, cy)
             if grasp_3d is None:
                 continue
- 
+
             placement_3d = self._compute_placement_surface(
                 full_mask, depth, fx, fy, cx, cy
             )
- 
+
             results.append({
                 "label":                item.get("label", ""),
                 "box_pixels":           {"x_min": x0, "y_min": y0, "x_max": x1, "y_max": y1},
@@ -283,7 +281,7 @@ class GeminiSegmentor:
                 "grasp_center_3d":      grasp_3d,
                 "placement_surface_3d": placement_3d,
             })
- 
+
         return results
 
     @staticmethod
@@ -296,7 +294,7 @@ class GeminiSegmentor:
             return None
 
         zs = depth[ys, xs]
-        valid = (zs > 0) & np.isfinite(zs)
+        valid = (zs > 0.05) & np.isfinite(zs)
         if not valid.any():
             return None
 
@@ -318,9 +316,6 @@ class GeminiSegmentor:
                                     surface_depth_percentile: float = 5.0) -> dict:
         """
         Stable placement point in camera frame.
-
-        Uses a low depth percentile (nearest surface) suited to downward-facing
-        cameras.  Adjust surface_depth_percentile for other orientations.
         """
         ys, xs = np.where(mask)
         if xs.size < 20:
@@ -346,24 +341,24 @@ class GeminiSegmentor:
             "z": float(z),
         }
 
-
     @staticmethod
     def _save_visualizations(rgb: np.ndarray, results: list[dict],
                               output_dir: str) -> dict:
-        """Save mask, overlay, and segmented images."""
-        output_dir = os.path.join(output_dir, "masks")
-        os.makedirs(output_dir, exist_ok=True)
+        """Save mask, overlay, and segmented images rewriting the standard filenames."""
+        masks_dir = os.path.join(output_dir, "masks")
+        os.makedirs(masks_dir, exist_ok=True)
 
         H, W = rgb.shape[:2]
         individual_masks = []
 
-        for i, res in enumerate(results):
+        mask_path = os.path.join(masks_dir, "mask.png")
+        seg_path = os.path.join(masks_dir, "segmented.png")
+
+        for res in results:
             obj_mask = res["mask"].astype(np.uint8) * 255
-            mask_path = os.path.join(output_dir, "mask.png")
             Image.fromarray(obj_mask, mode="L").save(mask_path)
 
             obj_segmented = np.where(res["mask"][:, :, None], rgb, 0)
-            seg_path = os.path.join(output_dir, "segmented.png")
             Image.fromarray(obj_segmented.astype(np.uint8), mode="RGB").save(seg_path)
 
             individual_masks.append({
@@ -390,9 +385,9 @@ class GeminiSegmentor:
             overlay[mask, 0] = (overlay[mask, 0] * 0.6).astype(np.uint8)
             overlay[mask, 2] = (overlay[mask, 2] * 0.6).astype(np.uint8)
 
-        combined_mask_path = os.path.join(output_dir, "mask_combined.png")
-        combined_seg_path  = os.path.join(output_dir, "segmented_combined.png")
-        overlay_path       = os.path.join(output_dir, "overlay.png")
+        combined_mask_path = os.path.join(masks_dir, "mask_combined.png")
+        combined_seg_path  = os.path.join(masks_dir, "segmented_combined.png")
+        overlay_path       = os.path.join(masks_dir, "overlay.png")
 
         Image.fromarray(combined_mask, mode="L").save(combined_mask_path)
         Image.fromarray(colored_seg, mode="RGB").save(combined_seg_path)
@@ -404,7 +399,6 @@ class GeminiSegmentor:
             "combined_segmented_path": combined_seg_path,
             "overlay_path": overlay_path,
         }
-
 
     @staticmethod
     def _make_combined_segmap(results: list[dict]) -> np.ndarray:
@@ -435,7 +429,6 @@ class GeminiSegmentor:
         os.makedirs(os.path.dirname(out_npz_path), exist_ok=True)
         np.savez_compressed(out_npz_path, **data)
         return out_npz_path
-
 
     @staticmethod
     def _parse_response(text: str) -> list[dict]:
