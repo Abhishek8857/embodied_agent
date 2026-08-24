@@ -230,11 +230,11 @@ def get_tools(node):
                       "Use after segment_objects. Returns x,y,z,qx,qy,qz,qw ready for place_object.")
     def get_place_pose(timeout_s: float,
                        target_object_label: str = None,
-                       height_offset: float = 0.175):
+                       height_offset: float = 0.23):
         """
         Args:
             target_object_label: Which object to place on (e.g. 'red cube'). If None, uses first.
-            height_offset:       Clearance above surface in metres (default 0.175)
+            height_offset:       Clearance above surface in metres
         """
         if _state["last_segmentation"] is None:
             return {"success": False, "error": "No segmentation results found. Call segment_objects first."}
@@ -243,7 +243,7 @@ def get_tools(node):
         return get_placement_pose(
             _state["last_segmentation"],
             target_object_label=target_object_label,
-            height_offset=height_offset,
+            height_offset=0.23,
             tf_transform=tf_transform,
             apply_tf=True,
         )

@@ -7,7 +7,7 @@ def get_placement_pose(
     segmentation_results: dict,
     target_object_label: str = None,
     object_index: int = 0,
-    height_offset: float = 0.05,  # Reduced for better accuracy (was 0.2)
+    height_offset: float = 0.23,  # Reduced for better accuracy (was 0.2)
     gripper_orientation: str = "downward",
     tf_transform: dict = None,
     apply_tf: bool = True,
@@ -107,9 +107,9 @@ def get_placement_pose(
         x, y, z_surface = float(p_base[0]), float(p_base[1]), float(p_base[2])
         
         
-        X_OFFSET = 0.025
-        Y_OFFSET_LEFT = 0.020
-        Y_OFFSET_RIGHT = 0.05
+        X_OFFSET = -0.0125
+        Y_OFFSET_LEFT = 0.028
+        Y_OFFSET_RIGHT = 0.015
         
         
         x += X_OFFSET
@@ -120,16 +120,16 @@ def get_placement_pose(
             y -= Y_OFFSET_RIGHT
             
             
-        # Sanity check
+        # Sanity check: Expand lower bound to -0.20m to allow surfaces at/below base level
         if x < -0.2 or x > 0.8:
             print(f"[WARNING] X={x:.4f} is outside typical reach range [-0.2, 0.8]")
         if abs(y) > 0.6:
             print(f"[WARNING] Y={y:.4f} is outside typical lateral range [-0.6, 0.6]")
-        if z_surface < 0 or z_surface > 1.0:
+        if z_surface < -0.20 or z_surface > 1.0:
             print(f"[WARNING] Unusual z_surface={z_surface:.4f}")
             return {
                 "success": False,
-                "error": f"Z={z_surface:.4f} is outside expected range [0, 1.0]m"
+                "error": f"Z={z_surface:.4f} is outside expected range [-0.20, 1.0]m"
             }
 
     # Add height offset

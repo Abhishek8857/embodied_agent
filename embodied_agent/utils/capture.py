@@ -1,5 +1,3 @@
-# embodied_agent/utils/capture.py
-
 import time
 import threading
 import numpy as np
@@ -33,7 +31,7 @@ class OneShotImageSubscriber:
         self._qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
-            reliability=ReliabilityPolicy.BEST_EFFORT,  # common for camera streams
+            reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
         )
 
@@ -51,7 +49,6 @@ class OneShotImageSubscriber:
 
     def capture(self, timeout_s: float = 2.0) -> Optional[Image]:
         ok = self._event.wait(timeout=float(timeout_s))
-        # cleanup subscription immediately
         try:
             self.node.destroy_subscription(self._sub)
         except Exception:
@@ -95,7 +92,7 @@ def capture_rgbd_npz(
     save_dir: str = "captures/rgbd",
     filename: str = "rgbd.npz",
     rgb_topic: str = "/camera/color/image_raw",
-    depth_topic: str = "/camera/depth/image_rect_raw",
+    depth_topic: str = "/camera/depth_registered/image_rect",
     camera_info_topic: str = "/camera/color/camera_info",
     timeout_s: float = 2.0,
 ) -> Dict[str, Any]:
@@ -131,9 +128,6 @@ def capture_rgbd_npz(
     depth_raw = bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
     depth_np = np.array(depth_raw)
 
-    # Convert depth to meters depending on encoding
-    # - 16UC1 commonly means millimeters
-    # - 32FC1 commonly means meters
     enc = depth_msg.encoding.lower()
     if "16uc1" in enc or depth_np.dtype == np.uint16:
         depth_m = depth_np.astype(np.float32) / 1000.0
@@ -142,8 +136,7 @@ def capture_rgbd_npz(
 
     if rgb.shape[:2] != depth_m.shape[:2]:
         raise RuntimeError(
-            f"RGB and depth sizes differ: rgb={rgb.shape[:2]} depth={depth_m.shape[:2]}. "
-            f"Isaac depth is not registered to color. Either register depth or store separately."
+            f"RGB and depth sizes differ: rgb={rgb.shape[:2]} depth={depth_m.shape[:2]}."
         )
 
     K = np.array(info_msg.k, dtype=np.float64)
@@ -163,14 +156,10 @@ def capture_rgbd_npz(
 
 
 def capture_rgb_image(node,
-                  save_dir: str = "captures/rgb",
-                  topic: str = "/camera/color/image_raw",
-                  filename: Optional[str] = None,
-                  timeout_s: float = 2.0) -> str:
-    """
-    Capture one RGB image and save it as JPG.
-    Returns the saved filepath.
-    """
+                      save_dir: str = "captures/rgb",
+                      topic: str = "/camera/color/image_raw",
+                      filename: Optional[str] = None,
+                      timeout_s: float = 2.0) -> str:
     out_dir = Path(save_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -187,7 +176,7 @@ def capture_rgb_image(node,
     out_path = out_dir / filename
     if out_path.exists():
         out_path.unlink()
-        
+
     ok = cv2.imwrite(str(out_path), cv_img)
     if not ok:
         raise RuntimeError(f"Failed to write image to '{out_path}'")
@@ -196,16 +185,10 @@ def capture_rgb_image(node,
 
 
 def capture_raw_depth_image(node,
-                        save_dir: str = "captures/depth",
-                        topic: str = "/camera/depth/image_rect_raw",
-                        filename_prefix: str = "depth",
-                        timeout_s: float = 2.0) -> Tuple[str, Optional[str]]:
-    """
-    Capture one depth image and save:
-      - always: raw depth as .npy (lossless)
-      - optionally: .png if depth is uint16 (16UC1)
-    Returns: (npy_path, png_path_or_None)
-    """
+                            save_dir: str = "captures/depth",
+                            topic: str = "/camera/depth_registered/image_rect",
+                            filename_prefix: str = "depth",
+                            timeout_s: float = 2.0) -> Tuple[str, Optional[str]]:
     out_dir = Path(save_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -218,16 +201,14 @@ def capture_raw_depth_image(node,
     depth_np = np.array(depth)
 
     npy_path = out_dir / f"{filename_prefix}.npy"
-    
     if npy_path.exists():
         npy_path.unlink()
-        
+
     np.save(str(npy_path), depth_np)
 
     png_path = None
     fixed_png_path = out_dir / f"{filename_prefix}.png"
 
-    # Save 16-bit PNG only if uint16 (typical for 16UC1)
     if depth_np.dtype == np.uint16:
         if fixed_png_path.exists():
             fixed_png_path.unlink()
@@ -236,5 +217,5 @@ def capture_raw_depth_image(node,
     else:
         if fixed_png_path.exists():
             fixed_png_path.unlink()
-            
+
     return str(npy_path), (str(png_path) if png_path else None)

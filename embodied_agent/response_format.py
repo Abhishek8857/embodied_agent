@@ -1,5 +1,5 @@
-from pydantic import BaseModel, field_validator
-from typing import List, Union, Literal, Any
+from typing import Any, List, Literal, Union
+from pydantic import BaseModel, ConfigDict, field_validator
 import json
 
 
@@ -17,12 +17,12 @@ class ToolResult(BaseModel):
 
 
 class ResponseFormat(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     response: str
-    answer: Union[int, float, str] | None = None
-    tools: Union[List[ToolResult]] | None = None
+    # Accepts scalar primitives, lists, dictionaries, or None
+    answer: Union[int, float, str, List[Any], dict, None] = None
+    tools: List[ToolResult] | None = None
     task_type: Literal["action", "query"] = "query"
     outcome: Literal["success", "failed"] = "success"
     failure_reason: str | None = None
-
-    class Config:
-        extra = "forbid"

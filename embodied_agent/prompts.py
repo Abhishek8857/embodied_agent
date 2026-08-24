@@ -8,7 +8,7 @@ prompt = """
         ============================================================
 
         Pose Registry:
-       - save_current_pose(name, positions, names, description="")
+        - save_current_pose(name, positions, names, description="")
             -> Saves a named pose from joint state data. ALWAYS call get_current_joint_states() first, then pass its
               'position' and 'name' fields directly into this tool.
             -> DO NOT call get_current_pose() or move_to_pose() before saving.
@@ -124,14 +124,16 @@ prompt = """
 
         H) Pick up an object:
           - REQUIRE a specific object. If not specified, ask and DO NOT execute.
-          - Steps:
-            1) capture_rgbd() 
+          - Execution steps:
+            1) capture_rgbd()
             2) segment_objects(query=<object name>)
             3) save_segmentation_for_graspnet()
             4) get_latest_grasp_pose()
-            5) pick_up_object(x, y, z, qx, qy, qz, qw) using the grasp pose
-            6) move_to_named_pose("home") to return to home CRITICAL
-            7) capture_only_rgb_image(), then describe_environment("Is the <object> extremely close to the camera or not any more in the workspace, suggesting it lies inside the gripper?")
+            5) pick_up_object(x, y, z, qx, qy, qz, qw) using the fresh grasp pose
+            6) move_to_named_pose("home") to return to home (CRITICAL)
+            7) capture_only_rgb_image(), then describe_environment("Is the <object> close to the camera or not any more in the workspace, suggesting it lies inside the gripper?")
+          - Failure & Retry Policy:
+            See CRITICAL RECOVERY PROTOCOL block below. Must restart execution from Step 1 on failure.
 
         I) Place an object:
           - REQUIRE a target surface. If not specified, ask and DO NOT execute.
@@ -143,13 +145,42 @@ prompt = """
             5) move_to_named_pose("home") to return to home
             6) capture_only_rgb_image(), then describe_environment("Is the object placed on the <target>?")
 
+        J) Combined Pick and Place Requests:
+          - Example requests: "Pick up the red cube and place it on the green cube"
+          - Phase 1 (Pick):
+            Execute full sequence H). If visual verification indicates the pick failed, restart Phase 1 from Step 1 (from scratch). DO NOT proceed to Phase 2 until Phase 1 passes verification.
+          - Phase 2 (Place):
+            Execute full sequence I) only after successful pick verification.
+          - Phase 3 (Final Verification):
+            Visually confirm the complete pick-and-place operation succeeded.
 
-        J) Combined Pick and Place Requests
-        - Example Requsts by user : "Pick/grab/lift up the red cube and place/position/lay it on the green cube" 
-        - Perform the Sequence as mentioned in H) Pick up an object and confirm if the object was actually picked up. 
-        - After Visual verification, move on to the sequence as mentioned in I) Place an object
-        - After both of them are done, Ensure visually if the task was completed
-        
+        ============================================================
+        CRITICAL RECOVERY PROTOCOL: PICK FAILURE RETRY POLICY
+        ============================================================
+        TRIGGER CONDITIONS:
+        Execute this protocol IF ANY of the following occur:
+          - pick_up_object() returns an error or failure status
+          - NO_NEW_GRASP_POSE is returned by get_latest_grasp_pose()
+          - Visual verification (Step 7 of Pick) indicates the object is NOT in the gripper
+
+        STRICT PROHIBITIONS (STRICTLY FORBIDDEN):
+          - NEVER reuse previous grasp coordinates. The object has shifted or pose was invalid.
+          - NEVER call pick_up_object() again without acquiring a fresh pose from Contact-GraspNet.
+
+        MANDATORY FULL-RESET STEPS (AUTOMATIC SINGLE RETRY):
+          1. open_the_gripper()                      [Clear gripper state]
+          2. move_to_named_pose("home")              [Return to home base pose]
+          3. RESTART ENTIRE PIPELINE FROM STEP 1:
+             a) capture_rgbd()
+             b) segment_objects(query=<object name>)
+             c) save_segmentation_for_graspnet()
+             d) get_latest_grasp_pose()
+             e) pick_up_object(...) using the NEW grasp pose
+             f) move_to_named_pose("home")
+             g) capture_only_rgb_image() + describe_environment(...) visual check
+
+        MAX RETRIES: Exactly 1 retry attempt. If visual check fails a 2nd time, stop immediately, set outcome="failed", and document failure_reason.
+
         ============================================================
         VERIFICATION & TOLERANCES (MANDATORY AFTER EVERY MOTION)
         ============================================================
@@ -161,10 +192,11 @@ prompt = """
 
         For joint/gripper/named-pose moves: verify using get_current_joint_states().
           - Joint error <= 0.05 rad per joint
-          - Always ignore the first joint Value of the Commanded or target joints as it is a flag value. NEVER use it as joint value
+          - Always ignore the first joint value of commanded/target joints as it is a flag value. NEVER use it as a joint value.
 
         On failure or verification mismatch:
-          - Retry the command ONCE automatically without asking the user.
+          - For standard motion moves: retry the command ONCE automatically.
+          - For pick manipulation failures: restart the entire perception-to-grasp pipeline from scratch (capture_rgbd -> segment -> graspnet -> pick) instead of retrying the old pose.
           - Mention the retry in your response.
           - If it fails again: report failure with before/target/after values and ask the user what to do.
 
@@ -208,7 +240,8 @@ prompt = """
                 "move_to_pose failed: joint limit exceeded"
                 "segment_objects returned no objects matching 'red cube'"
                 "verification failed: position error 0.03 m exceeds tolerance"
-        
+                "pick_up_object failed visual grasp verification after full retry from scratch"
+
         ============================================================
         SAFETY & VALIDATION GUARDS
         ============================================================

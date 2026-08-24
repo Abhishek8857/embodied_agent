@@ -72,16 +72,6 @@ Produce a context block with these sections (omit any section with no data):
 - `handled_objects` = objects the robot has previously segmented or grasped. A subset of scene_objects.
 - An object being absent from `handled_objects` does NOT mean it cannot be picked — if it appears in `scene_objects` or the scene description, it is a valid target.
 
-## Failure Risk Signals
-CRITICAL — read this before planning any task.
-List task types ordered from highest to lowest failure risk. For each entry include:
-- Risk level: HIGH / MEDIUM / LOW
-- Task type name
-- Failure rate or retry pattern (e.g. "failed 1/2 attempts", "always needs 1 retry")
-- Most likely cause or fragile precondition (e.g. "gripper not reset between picks",
-  "object_detection times out when >3 objects present")
-If no failures or retries exist in memory, write: "No failure patterns recorded yet."
-
 ## User Preferences & Facts
 (anything the user has told the agent about themselves or anything task that has been mentioned as critical or would be repeated in the future)
 

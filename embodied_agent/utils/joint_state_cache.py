@@ -2,14 +2,20 @@ import math
 import threading
 import time
 
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from sensor_msgs.msg import JointState
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
 
 class JointStateCache:
-    """Subscribes to a JointState topic and keeps the latest message."""
+    """Subscribes to /joint_states, sorts arm joints 1-7, and filters out gripper joints."""
+
+    # Explicit order required by MoveIt / Controller
+    TARGET_ARM_JOINTS = [
+        "joint_1", "joint_2", "joint_3", 
+        "joint_4", "joint_5", "joint_6", "joint_7"
+    ]
 
     def __init__(self, node, topic: str = "/joint_states", qos: Optional[QoSProfile] = None):
         self.topic = topic
@@ -40,7 +46,7 @@ class JointStateCache:
 
     @staticmethod
     def _wrap(a: float) -> float:
-        """Wrap a single angle to [−π, +π]."""
+        """Wrap a single angle to [-pi, +pi]."""
         return (a + math.pi) % (2 * math.pi) - math.pi
 
     def get_latest(self, max_age_s: float = 1.0) -> Dict[str, Any]:
@@ -62,18 +68,32 @@ class JointStateCache:
                 "error_description": f"Latest '{self.topic}' is stale (age={age:.3f}s > {max_age_s}s).",
             }
 
-        positions = list(msg.position)
+        # Create explicit mapping from joint name -> value
+        name_to_pos = dict(zip(msg.name, msg.position))
+        name_to_vel = dict(zip(msg.name, msg.velocity)) if msg.velocity else {}
+
+        # Extract positions strictly in numerical order joint_1 -> joint_7
+        ordered_positions = []
+        ordered_velocities = []
+
+        for name in self.TARGET_ARM_JOINTS:
+            if name in name_to_pos:
+                ordered_positions.append(name_to_pos[name])
+                ordered_velocities.append(name_to_vel.get(name, 0.0))
+            else:
+                return {
+                    "success": False,
+                    "error_code": "MISSING_JOINT",
+                    "error_description": f"Required joint '{name}' not found in /joint_states message.",
+                }
+
+        normalized = [self._wrap(p) for p in ordered_positions]
 
         return {
             "success": True,
             "age_s": float(age),
-            "name": list(msg.name),
-            # Raw Isaac frame — unbounded, used by the bridge for shift alignment.
-            "position": positions,
-            # Wrapped to [−π, +π] — same frame MoveIt uses.
-            # ALWAYS use this field when comparing against a commanded pose.
-            # +3.1217 and −3.1622 are the same physical position (differ by 2π).
-            "normalized_position": [self._wrap(p) for p in positions],
-            "velocity": list(msg.velocity) if msg.velocity else [],
-            "effort": list(msg.effort) if msg.effort else [],
+            "name": self.TARGET_ARM_JOINTS,
+            "position": ordered_positions,
+            "normalized_position": [round(p, 4) for p in normalized],
+            "velocity": ordered_velocities,
         }
