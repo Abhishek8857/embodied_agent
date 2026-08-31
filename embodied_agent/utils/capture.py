@@ -93,7 +93,7 @@ def capture_rgbd_npz(
     filename: str = "rgbd.npz",
     rgb_topic: str = "/camera/color/image_raw",
     depth_topic: str = "/camera/depth_registered/image_rect",
-    camera_info_topic: str = "/camera/color/camera_info",
+    camera_info_topic: str = "/camera/depth_registered/camera_info",
     timeout_s: float = 2.0,
 ) -> Dict[str, Any]:
     """
