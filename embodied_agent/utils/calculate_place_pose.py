@@ -108,7 +108,7 @@ def get_placement_pose(
         
         
         X_OFFSET = -0.0125
-        Y_OFFSET_LEFT = 0.028
+        Y_OFFSET_LEFT = 0.03
         Y_OFFSET_RIGHT = 0.015
         
         

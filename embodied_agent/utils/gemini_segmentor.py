@@ -16,7 +16,7 @@ class GeminiSegmentor:
     """
     Open-vocabulary object segmentation using Gemini Robotics model.
 
-    Uses gemini-robotics-er-1.6-preview which returns point-based detections.
+    Uses gemini-robotics-er-2-preview which returns point-based detections.
     Each point is expanded into a 3D Euclidean spatial cluster with relaxed
     color constraints to segment full multi-face object shapes and back-project
     through depth to produce 3D grasp/placement points.
@@ -26,7 +26,7 @@ class GeminiSegmentor:
         results = segmentor.segment("captures/rgbd/rgbd_image.npz", "blue cube")
     """
 
-    MODEL_NAME = "gemini-robotics-er-1.6-preview"
+    MODEL_NAME = "gemini-robotics-er-2-preview"
 
     def __init__(self):
         self._client = genai.Client(api_key=get_gemini_api_key())
@@ -107,7 +107,7 @@ class GeminiSegmentor:
 
     def _query_gemini(self, rgb: np.ndarray, query: str) -> list[dict]:
         """
-        Query Gemini 1.6 for object points.
+        Query Gemini Robotics ER 2 for object points.
         """
         image = Image.fromarray(rgb, mode="RGB")
         image.thumbnail([1024, 1024], Image.Resampling.LANCZOS)
@@ -125,9 +125,12 @@ class GeminiSegmentor:
             f'Return ONLY the JSON array, no markdown, no explanation.'
         )
 
+        # ER 2 is built on the Gemini 3.5 Flash line, which uses thinking_level
+        # (Low/High) rather than thinking_budget. "low" gives the fastest,
+        # least-reasoning behavior closest to the old thinking_budget=0 setting.
         config = types.GenerateContentConfig(
             temperature=1.0,
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            thinking_config=types.ThinkingConfig(thinking_level="low"),
         )
 
         response = self._client.models.generate_content(
@@ -200,7 +203,7 @@ class GeminiSegmentor:
                 delta_lab = lab_img - lab_seed
                 # Downweight Lightness (L) channel by 80% to ignore shadows across faces
                 delta_lab[:, :, 0] *= 0.2
-                
+
                 color_dist = np.linalg.norm(delta_lab, axis=2)
                 color_ok = color_dist <= color_tol_lab
 
@@ -294,8 +297,8 @@ class GeminiSegmentor:
 
             u = float(np.median(xs_v))
             v = float(np.median(ys_v))
-            
-            # CHANGED: 95th percentile finds the furthest points from the camera (the table surface)
+
+            # 95th percentile finds the furthest points from the camera (the table surface)
             z = float(np.percentile(zs_v, surface_depth_percentile))
 
             return {
